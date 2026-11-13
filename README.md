@@ -6,8 +6,10 @@ Say **"Hey &lt;agent name&gt;"** and talk to your own Grok Bot agent, on [Omarch
 
 - **Unlocked:** the screen goes black with the full Grok Bot head rocking inside a large white
   circle, and a green-to-blue bar waveform under it moves with your voice, like a phone-call
-  visualizer. Grok Bot opens that agent and its voice chat starts. Move the mouse or press any
-  key to clear the black screen; Grok Bot stays in front.
+  visualizer. Grok Bot opens that agent and its voice chat starts. When the voice chat ends
+  (the app closes its microphone), the black screen hides itself and focus goes back to
+  Grok Bot. Move the mouse or press any key to clear it sooner; Grok Bot stays in front.
+  If voice never actually starts, the overlay gives up after about 20 seconds.
 - **Locked** (with the optional [lock integration](lock-integration/README.md)): it asks
   *"What's your voice password?"*, checks what you say on-device, unlocks, then does the above.
   A mic button on the lock screen does the same check on click. Only on Wi-Fi networks you trust;
@@ -69,10 +71,18 @@ never clicked. It counts as started when Grok Bot opens a microphone stream (`pa
 doesn't match (a draft, another theme, an app update) it does not guess: the chat is open and a
 notification asks you to click the voice button. `oma-voice-wake forget-button` relearns it.
 
+While the overlay is up, the listener keeps watching that same microphone stream. Once it has
+been gone for about 1.5 seconds — you said goodbye, or you hung up — the overlay hides and
+Grok Bot is focused again. If a stream never appears within about 20 seconds of the hand-off,
+the overlay hides anyway. Mouse move and any key still dismiss it immediately.
+`oma-voice-wake test-end-monitor` dry-runs this logic with a fake clock and a scripted mic
+(no wake, no overlay, no click).
+
 ## Commands
 
 ```
 oma-voice-wake status | wifi | test-wake [secs] | trigger <name>
+oma-voice-wake test-end-monitor
 oma-voice-wake passcode set | clear | status
 oma-voice-wake unlock-listen | forget-button
 journalctl --user -u oma-voice-wake -f

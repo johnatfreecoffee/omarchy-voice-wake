@@ -9,6 +9,7 @@
   oma-voice-wake unlock-listen       ask the listener to check a spoken passcode now (lock-screen mic button)
   oma-voice-wake test-wake [secs]    listen once and report what wake phrase was heard (no launch)
   oma-voice-wake trigger <name>      act as if "Hey <name>" was heard (testing, hotkeys)
+  oma-voice-wake test-end-monitor    dry-run: simulate mic appear/disappear and check overlay auto-hide
   oma-voice-wake wifi                print the active Wi-Fi network name(s)
   oma-voice-wake forget-button       drop the learned Grok Bot voice-button position
 
@@ -37,6 +38,11 @@ VOICE = os.path.join(APP, "voices/en_US-amy-low.onnx")
 VCLICK = os.path.join(APP, "bin/oma-vclick")
 RATE = 16000
 CHUNK = 1600  # 100 ms of 16-bit mono
+# After a hand-off, hide the black overlay when Grok Bot's voice chat ends (mic stream gone)
+# or if a stream never appears. Mouse/key dismissal in the overlay still works.
+OVERLAY_MIC_GONE_S = 1.5
+OVERLAY_MIC_APPEAR_S = 20.0
+OVERLAY_POLL_S = 0.2
 
 DEFAULTS = {
     "enabled": True,
@@ -385,6 +391,146 @@ def grok_recording():
     return False
 
 
+def overlay_visible():
+    """True/False from the shell plugin; None if the IPC didn't answer."""
+    # Do not use omarchy-shell -q here: quiet mode suppresses the method's return value.
+    out = sh(["omarchy-shell", "voicewake", "isVisible"], 3)
+    if out in ("true", "1"):
+        return True
+    if out in ("false", "0"):
+        return False
+    return None
+
+
+def focus_grok():
+    """Put keyboard focus back on the Grok Bot window after the overlay goes away."""
+    win = grok_window() or {}
+    addr = win.get("address")
+    if not addr:
+        return
+    try:
+        subprocess.run(["hyprctl", "dispatch", "focuswindow", f"address:{addr}"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+    except Exception:
+        pass
+
+
+def hide_overlay():
+    shell_ipc("hide")
+    focus_grok()
+
+
+def watch_for_voice_end(*, already_live, appear_s=OVERLAY_MIC_APPEAR_S, gone_s=OVERLAY_MIC_GONE_S,
+                        poll_s=OVERLAY_POLL_S, recording_fn=None, visible_fn=None,
+                        sleep_fn=None, clock_fn=None, stop_fn=None):
+    """Decide when the wake overlay should hide, without driving the real screen.
+
+    Returns one of:
+      mic-ended        Grok Bot had a mic stream, then it was gone for gone_s
+      never-appeared   no mic stream within appear_s of the start
+      already-hidden   the overlay was dismissed first (mouse, key, or hide)
+      stopped          stop_fn became true (a newer wake cancelled this watch)
+
+    recording_fn / visible_fn / sleep_fn / clock_fn are injectable so the logic can be
+    exercised with a fake clock and a scripted mic, with no real wake or overlay.
+    """
+    recording_fn = recording_fn or grok_recording
+    visible_fn = visible_fn or overlay_visible
+    sleep_fn = sleep_fn or time.sleep
+    clock_fn = clock_fn or time.time
+
+    def still_shown():
+        v = visible_fn()
+        return True if v is None else v
+
+    def cancelled():
+        return bool(stop_fn and stop_fn())
+
+    t0 = clock_fn()
+    seen = bool(already_live) or bool(recording_fn())
+    if not seen:
+        while True:
+            if cancelled():
+                return "stopped"
+            if not still_shown():
+                return "already-hidden"
+            now = clock_fn()
+            if now - t0 >= appear_s:
+                return "never-appeared"
+            if recording_fn():
+                seen = True
+                break
+            sleep_fn(poll_s)
+
+    gone_since = None
+    while True:
+        if cancelled():
+            return "stopped"
+        if not still_shown():
+            return "already-hidden"
+        now = clock_fn()
+        if recording_fn():
+            gone_since = None
+        else:
+            if gone_since is None:
+                gone_since = now
+            elif now - gone_since >= gone_s:
+                return "mic-ended"
+        sleep_fn(poll_s)
+
+
+class _FakeClock:
+    def __init__(self, start=0.0):
+        self.t = float(start)
+
+    def time(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += float(s)
+
+
+def test_end_monitor():
+    """Scripted dry-run of watch_for_voice_end. No mic, no overlay, no Grok Bot click."""
+    cases = []
+
+    def case(name, expect, already, intervals, visible_until=10**9, appear=20.0, gone=1.5, stop_at=None, poll=0.2):
+        clock = _FakeClock()
+        def rec():
+            t = clock.time()
+            return any(a <= t < b for a, b in intervals)
+        def vis():
+            return clock.time() < visible_until
+        stop = (lambda: clock.time() >= stop_at) if stop_at is not None else None
+        got = watch_for_voice_end(already_live=already, appear_s=appear, gone_s=gone, poll_s=poll,
+                                  recording_fn=rec, visible_fn=vis, sleep_fn=clock.sleep,
+                                  clock_fn=clock.time, stop_fn=stop)
+        ok = got == expect
+        cases.append((ok, name, expect, got, clock.time()))
+        print(("ok" if ok else "FAIL") + f": {name} -> {got} (expected {expect}) at t={clock.time():.2f}s")
+
+    # Live from the start, ends at 5s, hide after 1.5s of silence.
+    case("mic ended after a live call", "mic-ended", True, [(0, 5)])
+    # A short dropout must not hide the overlay.
+    case("brief mic dropout is ignored", "mic-ended", True, [(0, 2), (2.4, 5)])
+    # Safety timeout: no stream ever appears.
+    case("no mic within 20s", "never-appeared", False, [])
+    # Stream shows up late (user clicked the button), then the call ends.
+    case("mic appears later then ends", "mic-ended", False, [(3, 8)])
+    # User dismissed with the mouse/key while the call was still live.
+    case("mouse/key already hid it", "already-hidden", True, [(0, 50)], visible_until=2.0)
+    # already_live is false, but the first poll already sees the stream.
+    case("first poll already live", "mic-ended", False, [(0, 4)])
+    # A newer wake cancels this watch.
+    case("cancelled by a newer wake", "stopped", True, [(0, 50)], stop_at=1.0)
+    # Thought it was live, but the stream is already gone: still wait the grace period.
+    case("already-live but stream already gone", "mic-ended", True, [])
+
+    failed = [c for c in cases if not c[0]]
+    print(f"{len(cases) - len(failed)}/{len(cases)} passed")
+    return 0 if not failed else 1
+
+
 def grab(x, y, w, h):
     import numpy as np
     raw = subprocess.run(["grim", "-g", f"{x},{y} {w}x{h}", "-t", "ppm", "-"], capture_output=True, timeout=5).stdout
@@ -563,6 +709,7 @@ class Listener:
         self.status_cache = None
         self.level_until = 0
         self.test_until = 0
+        self._overlay_gen = 0
 
     # status for the lock screen + Settings
     def write_status(self, force=False):
@@ -766,8 +913,30 @@ class Listener:
         log("hand-off:", name, outcome)
         if self.cfg.get("overlay", True):
             shell_ipc("setLive", "true")
+            already_live = outcome in ("voice-live", "already-live")
+            self.watch_overlay_end(already_live)
         if outcome in ("no-window", "button-not-found", "clicked-unconfirmed") or outcome.startswith("error"):
             notify(f"Hey {name}", "Opened the chat. Click the voice button to talk (I couldn't start voice by myself).")
+
+    def watch_overlay_end(self, already_live):
+        """While the overlay is up, hide it when Grok Bot's voice chat ends (or never starts)."""
+        self._overlay_gen += 1
+        gen = self._overlay_gen
+
+        def watcher():
+            reason = watch_for_voice_end(already_live=already_live,
+                                         stop_fn=lambda: gen != self._overlay_gen)
+            if gen != self._overlay_gen:
+                return
+            self.level_until = 0
+            if reason in ("mic-ended", "never-appeared"):
+                log("overlay hide:", reason)
+                hide_overlay()
+            elif reason == "already-hidden":
+                log("overlay hide: already-hidden")
+                focus_grok()
+
+        threading.Thread(target=watcher, daemon=True, name="oma-overlay-watch").start()
 
 
 # ------------------------------------------------------------------ CLI
@@ -862,6 +1031,8 @@ def main(argv):
         except FileNotFoundError:
             pass
         print("forgotten")
+    elif cmd == "test-end-monitor":
+        return test_end_monitor()
     else:
         print(__doc__.strip()); return 2
     return 0
