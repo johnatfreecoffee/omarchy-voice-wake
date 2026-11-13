@@ -85,8 +85,14 @@ put "$SRC/plugin/Service.qml" "$PLUG/Service.qml" 644
 ICON=/usr/share/icons/hicolor/512x512/apps/grok-bot.png
 if [[ -e $ICON ]]; then
   tmp="$(mktemp --suffix=.png)"
-  magick "$ICON" -negate \( -size 512x512 xc:black -fill white -draw "circle 256,256 256,3" \) -alpha off -compose CopyOpacity -composite "$tmp"
-  put "$tmp" "$PLUG/head.png" 644; rm -f "$tmp"
+  # The official icon is a cropped close-up; make-head.py fills the missing
+  # chin and left side so the whole head sits inside the white disc.
+  if "$D/venv/bin/python" "$SRC/plugin/make-head.py" "$ICON" "$tmp"; then
+    put "$tmp" "$PLUG/head.png" 644
+  else
+    warn "could not rebuild head.png from $ICON; leaving any existing head in place."
+  fi
+  rm -f "$tmp"
 else
   warn "Grok Bot app icon not found ($ICON): the overlay shows an empty white circle."
 fi

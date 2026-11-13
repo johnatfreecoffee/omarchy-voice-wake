@@ -3,8 +3,10 @@
 //   setCapture true|false    hide it for one screenshot while the listener finds Grok Bot's voice button
 //   setLive true             from now on a mouse move or any key dismisses it
 //   hide / isVisible
-// The head bobs and the rings pulse with the microphone level the listener writes to
-// $XDG_RUNTIME_DIR/oma-voice-wake/level while the overlay is up.
+// The official Grok Bot icon is a cropped close-up of the head (chin and left side clipped).
+// install.sh rebuilds head.png as the full head, centered, so it sits inside the disc with padding.
+// The head rocks gently; a phone-call-style bar waveform under the disc follows the
+// microphone level the listener writes to $XDG_RUNTIME_DIR/oma-voice-wake/level.
 import QtQuick
 import Quickshell
 import Quickshell.Io
@@ -114,62 +116,113 @@ Item {
           onWheel: function(w) { if (root.live) root.dismiss() }
         }
 
-        // Pulse rings, scaled by the voice level.
-        Repeater {
-          model: 3
+        Column {
+          id: cluster
+          anchors.centerIn: parent
+          anchors.verticalCenterOffset: -12
+          spacing: 0
+          width: parent.width
+
           Rectangle {
-            required property int index
-            anchors.centerIn: disc
-            width: disc.width * (1.12 + index * 0.16 + root.level * (0.35 + index * 0.22))
+            id: disc
+            anchors.horizontalCenter: parent.horizontalCenter
+            // Dominant on screen: about 46% of the height, capped so it still fits in width.
+            width: Math.min(content.width * 0.72, content.height * 0.46)
             height: width
             radius: width / 2
-            color: "transparent"
-            border.width: 2
-            border.color: Qt.rgba(1, 1, 1, Math.max(0.05, 0.32 - index * 0.09 + root.level * 0.25))
-            Behavior on width { NumberAnimation { duration: 90 } }
+            color: "#ffffff"
+            antialiasing: true
+
+            // Full reconstructed head, centered, with comfortable white padding.
+            Image {
+              id: head
+              anchors.centerIn: parent
+              width: parent.width * 0.80
+              height: width
+              source: "file://" + root.headPath + "?v=3"
+              sourceSize.width: 1024
+              sourceSize.height: 1024
+              fillMode: Image.PreserveAspectFit
+              smooth: true
+              mipmap: true
+              antialiasing: true
+              property real phase: 0
+              NumberAnimation on phase { from: 0; to: Math.PI * 2; duration: 900; loops: Animation.Infinite; running: root.shown }
+              rotation: Math.sin(head.phase) * (1.5 + root.level * 8)
+              scale: 1 + Math.sin(head.phase * 2) * (0.008 + root.level * 0.03)
+            }
           }
-        }
 
-        Rectangle {
-          id: disc
-          anchors.centerIn: parent
-          anchors.verticalCenterOffset: -30
-          width: Math.min(parent.width, parent.height) * 0.26
-          height: width
-          radius: width / 2
-          color: "#ffffff"
-          scale: 1 + root.level * 0.05
+          Item { width: 1; height: 28 }
 
-          // The Grok Bot app icon, inverted and cut to a circle (head.png): the head rocks and
-          // breathes inside the white disc, more as the voice level rises.
-          Image {
-            id: head
-            anchors.centerIn: parent
-            width: parent.width * 0.92
-            height: width
-            source: "file://" + root.headPath + "?v=2"
-            sourceSize.width: 512
-            sourceSize.height: 512
-            fillMode: Image.PreserveAspectFit
-            smooth: true
-            mipmap: true
+          Text {
+            id: agentLabel
+            anchors.horizontalCenter: parent.horizontalCenter
+            textFormat: Text.PlainText
+            text: root.agentName.length ? root.agentName : "Grok Bot"
+            color: "#ffffff"
+            font.pixelSize: 34
+            font.weight: Font.DemiBold
+          }
+
+          Item { width: 1; height: 22 }
+
+          // In-call waveform: 32 rounded bars that grow from the middle, idle sine
+          // floor plus the mic level, colored emerald → cyan → sky.
+          Item {
+            id: wave
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: Math.min(content.width * 0.62, disc.width * 1.4)
+            height: Math.max(80, disc.width * 0.26)
+            property int barCount: 32
+            property real gap: 5
+            property real barW: Math.max(3, (width - gap * (barCount - 1)) / barCount)
             property real phase: 0
-            NumberAnimation on phase { from: 0; to: Math.PI * 2; duration: 900; loops: Animation.Infinite; running: root.shown }
-            rotation: Math.sin(head.phase) * (1.5 + root.level * 8)
-            scale: 1 + Math.sin(head.phase * 2) * (0.008 + root.level * 0.03)
+            NumberAnimation on phase {
+              from: 0
+              to: Math.PI * 2
+              duration: 2800
+              loops: Animation.Infinite
+              running: root.shown && !root.capturing
+            }
+
+            Repeater {
+              model: wave.barCount
+              Rectangle {
+                required property int index
+                width: wave.barW
+                radius: width / 2
+                antialiasing: true
+                x: index * (wave.barW + wave.gap)
+                anchors.verticalCenter: parent.verticalCenter
+                property real idle: 0.08 + 0.05 * Math.sin(wave.phase + index * 0.35)
+                property real dome: 0.45 + 0.55 * Math.sin(Math.PI * (index + 0.5) / wave.barCount)
+                property real jig: 0.88 + 0.12 * Math.sin(index * 1.7 + 0.4)
+                property real travel: 0.78 + 0.22 * Math.sin(wave.phase * 1.4 - index * 0.22)
+                property real t: Math.max(idle, idle + (1 - idle) * Math.min(1, root.level * 1.35) * dome * jig * travel)
+                height: Math.max(width, t * wave.height * 0.95)
+                color: {
+                  var u = index / Math.max(1, wave.barCount - 1)
+                  var r, g, b
+                  if (u < 0.5) {
+                    var s = u * 2
+                    r = (16 + (34 - 16) * s) / 255
+                    g = (185 + (211 - 185) * s) / 255
+                    b = (129 + (238 - 129) * s) / 255
+                  } else {
+                    var s = (u - 0.5) * 2
+                    r = (34 + (56 - 34) * s) / 255
+                    g = (211 + (189 - 211) * s) / 255
+                    b = (238 + (248 - 238) * s) / 255
+                  }
+                  return Qt.rgba(r, g, b, 0.96)
+                }
+                Behavior on height { NumberAnimation { duration: 80; easing.type: Easing.OutCubic } }
+              }
+            }
           }
         }
 
-        Text {
-          anchors.horizontalCenter: parent.horizontalCenter
-          anchors.top: disc.bottom
-          anchors.topMargin: disc.width * 0.42
-          textFormat: Text.PlainText
-          text: root.agentName.length ? root.agentName : "Grok Bot"
-          color: "#ffffff"
-          font.pixelSize: 26
-          font.weight: Font.DemiBold
-        }
         Text {
           anchors.horizontalCenter: parent.horizontalCenter
           anchors.bottom: parent.bottom

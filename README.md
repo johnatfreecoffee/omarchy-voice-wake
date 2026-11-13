@@ -4,8 +4,9 @@ Say **"Hey &lt;agent name&gt;"** and talk to your own Grok Bot agent, on [Omarch
 (Hyprland, Quickshell shell). Works on the desktop and from the lock screen. Listening is
 **fully offline**: nothing is recorded or sent anywhere until the Grok Bot app opens.
 
-- **Unlocked:** the screen goes black with the Grok Bot head rocking inside a white circle, in time with
-  your voice. Grok Bot opens that agent and its voice chat starts. Move the mouse or press any
+- **Unlocked:** the screen goes black with the full Grok Bot head rocking inside a large white
+  circle, and a green-to-blue bar waveform under it moves with your voice, like a phone-call
+  visualizer. Grok Bot opens that agent and its voice chat starts. Move the mouse or press any
   key to clear the black screen; Grok Bot stays in front.
 - **Locked** (with the optional [lock integration](lock-integration/README.md)): it asks
   *"What's your voice password?"*, checks what you say on-device, unlocks, then does the above.
