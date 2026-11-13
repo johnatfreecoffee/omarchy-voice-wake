@@ -6,10 +6,14 @@ Say **"Hey &lt;agent name&gt;"** and talk to your own Grok Bot agent, on [Omarch
 
 - **Unlocked:** the screen goes black with the full Grok Bot head rocking inside a large white
   circle, and a green-to-blue bar waveform under it moves with your voice, like a phone-call
-  visualizer. Grok Bot opens that agent and its voice chat starts. When the voice chat ends
-  (the app closes its microphone), the black screen hides itself and focus goes back to
-  Grok Bot. Move the mouse or press any key to clear it sooner; Grok Bot stays in front.
-  If voice never actually starts, the overlay gives up after about 20 seconds.
+  visualizer. Grok Bot opens that agent (it will launch the app if it isn't already running,
+  and wait up to 20 seconds for the window and composer to finish loading) and starts voice
+  chat. If a draft is in the composer, it clicks the mic button to the left of the send arrow,
+  not the arrow itself. When the voice chat ends (the app closes its microphone), the black
+  screen hides itself and focus goes back to Grok Bot. Move the mouse or press any key to
+  clear it sooner; Grok Bot stays in front. If the voice button can't be found, the overlay
+  hides immediately and a notification says to click the voice button to talk. If a click
+  was attempted but voice never actually starts, the overlay gives up after about 20 seconds.
 - **Locked** (with the optional [lock integration](lock-integration/README.md)): it asks
   *"What's your voice password?"*, checks what you say on-device, unlocks, then does the above.
   A mic button on the lock screen does the same check on click. Only on Wi-Fi networks you trust;
