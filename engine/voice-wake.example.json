@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "agents": [
+    {"name": "Grok", "phrase": "hey grok", "agentId": "", "enabled": false}
+  ],
+  "sensitivity": 0.5,
+  "overlay": true,
+  "openUrl": "grokbot://app/v1/agent?id={id}",
+  "startVoice": true,
+  "settleMs": 1400,
+  "voiceUnlock": {
+    "enabled": false,
+    "trustedWifi": [],
+    "maxTries": 3,
+    "lockoutMinutes": 5,
+    "requireTypedSinceBoot": true,
+    "lockScreenButton": true
+  },
+  "prompts": true
+}

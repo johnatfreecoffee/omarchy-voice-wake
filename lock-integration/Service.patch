@@ -1,0 +1,114 @@
+--- a/Service.qml
++++ b/Service.qml
+@@ -64,6 +64,33 @@
+ 
+   readonly property bool locked: lockRequested || sessionLock.locked || sessionLock.secure
+ 
++  // Oma Voice Wake (oma-voice-wake): the listener writes status.json (whether the lock-screen
++  // voice-passcode button may show and what it is doing). A spoken-passcode match unlocks through
++  // voiceUnlock(token): the listener first writes a one-time token (0600, 10 s) to unlock-token in
++  // its runtime dir, then calls this IPC with the same token. A typed unlock leaves typed-unlock
++  // there, so voice unlock stays off after every boot until the password has been typed once.
++  readonly property string voiceRunDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/oma-voice-wake"
++  property var voiceStatus: ({})
++  readonly property bool voiceButtonVisible: !!(voiceStatus && voiceStatus.lockButton)
++  readonly property string voicePhase: (voiceStatus && voiceStatus.phase) || "idle"
++
++  function readVoiceStatus() {
++    try { root.voiceStatus = JSON.parse(voiceStatusFile.text() || "{}") } catch (e) { root.voiceStatus = ({}) }
++  }
++
++  function voiceUnlockWith(token) {
++    if (!root.lockRequested && !root.currentlyLocked()) return "not-locked"
++    if (!token || String(token).length < 16) return "denied"
++    voiceTokenFile.reload()
++    var parts = String(voiceTokenFile.text() || "").trim().split(/\s+/)
++    voiceTokenClear.running = true
++    if (parts.length < 2 || parts[0] !== String(token)) { root.logEvent("voice-unlock-denied"); return "denied" }
++    if (Number(parts[1]) < Date.now()) { root.logEvent("voice-unlock-expired"); return "expired" }
++    root.logEvent("voice-unlocked")
++    root.finishUnlock()
++    return "ok"
++  }
++
+   // Decisions read the lock state afresh. A property binding that missed a change
+   // notification once reported locked after an unlock, and a lock request before
+   // suspend then took that for done and never locked the session.
+@@ -523,6 +550,9 @@
+         onSubmitPassword: function(password) { root.submitPassword(password) }
+         onClearFailureRequested: root.failureMessage = ""
+         onWakeRequested: root.runWake()
++        voiceButtonVisible: root.voiceButtonVisible
++        voicePhase: root.voicePhase
++        onVoiceRequested: { root.runWake(); if (!voiceListen.running) voiceListen.running = true }
+       }
+ 
+     }
+@@ -577,7 +607,7 @@
+       root.pendingPassword = ""
+ 
+       if (!root.lockRequested) return
+-      if (result === PamResult.Success) root.finishUnlock()
++      if (result === PamResult.Success) { voiceTypedMark.running = true; root.finishUnlock() }
+       else root.handlePasswordFailure()
+     }
+ 
+@@ -754,6 +784,47 @@
+     }
+   }
+ 
++  FileView {
++    id: voiceStatusFile
++    path: root.voiceRunDir + "/status.json"
++    watchChanges: true
++    printErrors: false
++    onFileChanged: reload()
++    onLoaded: root.readVoiceStatus()
++    onLoadFailed: root.voiceStatus = ({})
++  }
++
++  // The watch can miss an atomic replace; while locked, re-read every few seconds as well.
++  Timer {
++    interval: 3000
++    repeat: true
++    running: root.locked
++    onTriggered: voiceStatusFile.reload()
++  }
++
++  FileView {
++    id: voiceTokenFile
++    path: root.voiceRunDir + "/unlock-token"
++    blockLoading: true
++    blockAllReads: true
++    printErrors: false
++  }
++
++  Process {
++    id: voiceTokenClear
++    command: ["rm", "-f", root.voiceRunDir + "/unlock-token"]
++  }
++
++  Process {
++    id: voiceTypedMark
++    command: ["sh", "-c", "mkdir -p \"$1\" && chmod 700 \"$1\" && : > \"$1/typed-unlock\"", "sh", root.voiceRunDir]
++  }
++
++  Process {
++    id: voiceListen
++    command: ["sh", "-c", "exec \"$HOME/.local/bin/oma-voice-wake\" unlock-listen"]
++  }
++
+   Process {
+     id: wakeProcess
+     command: ["bash", "-c", "omarchy-system-wake"]
+@@ -887,6 +958,10 @@
+       return root.currentlyLocked() ? "true" : "false"
+     }
+ 
++    function voiceUnlock(token: string): string {
++      return root.voiceUnlockWith(token)
++    }
++
+     function status(): string {
+       return JSON.stringify({
+         locked: root.currentlyLocked(),

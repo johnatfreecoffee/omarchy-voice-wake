@@ -1,0 +1,12 @@
+omarchy-voice-wake
+Copyright 2026 johnatfreecoffee
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Downloaded at install time (not redistributed here):
+- Vosk speech recognition (Apache-2.0), https://alphacephei.com/vosk/ ; model vosk-model-small-en-us-0.15 (Apache-2.0)
+- Piper TTS (MIT / GPL-3.0 depending on version), https://github.com/rhasspy/piper ; voice en_US-amy-low (see its model card for license)
+- wlr-virtual-pointer-unstable-v1.xml (MIT), wlroots/wlr-protocols
+
+"Grok" and the Grok Bot icon belong to their owner. This add-on only reads the icon that the
+Grok Bot desktop app installs on your machine and is not affiliated with or endorsed by xAI.

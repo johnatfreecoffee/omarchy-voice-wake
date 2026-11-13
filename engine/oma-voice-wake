@@ -1,0 +1,4 @@
+#!/bin/sh
+# Oma Voice Wake: offline "Hey <agent>" wake for the Grok Bot app. See: oma-voice-wake --help
+D="${OMA_VOICE_WAKE_HOME:-$HOME/.local/share/oma-voice-wake}"
+exec "$D/venv/bin/python" "$D/oma_voice_wake.py" "$@"

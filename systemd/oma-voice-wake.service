@@ -1,0 +1,18 @@
+[Unit]
+Description=Oma Voice Wake: offline "Hey <agent>" listener for Grok Bot (Vosk, on-device)
+After=pipewire.service wireplumber.service wayland-session-waitenv.service
+ConditionEnvironment=WAYLAND_DISPLAY
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/oma-voice-wake run
+Restart=on-failure
+RestartSec=5
+Nice=5
+# The listener needs the Wayland/Hyprland session for the overlay hand-off and button press.
+Environment=PATH=/usr/share/omarchy/bin:%h/.local/bin:/usr/local/bin:/usr/bin
+Environment=OMARCHY_PATH=/usr/share/omarchy
+
+[Install]
+WantedBy=graphical-session.target

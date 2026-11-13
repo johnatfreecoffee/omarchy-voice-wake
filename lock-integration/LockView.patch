@@ -1,0 +1,67 @@
+--- a/LockView.qml
++++ b/LockView.qml
+@@ -18,6 +18,11 @@
+   property bool inputEnabled: true
+   property bool loadBackground: true
+   property string passwordText: ""
++  // Voice Wake: a round mic button under the field (only when a voice passcode is set and
++  // voice unlock is allowed here); clicking it starts a spoken-passcode check.
++  property bool voiceButtonVisible: false
++  property string voicePhase: "idle"
++  signal voiceRequested()
+   property bool syncingPasswordText: false
+ 
+   readonly property string placeholderText: Commons.I18n.t("lock.enterPassword")
+@@ -260,5 +265,52 @@
+       font.italic: true
+       horizontalAlignment: Text.AlignHCenter
+     }
++
++    Column {
++      id: voiceButton
++      objectName: "voicePasscodeButton"
++      anchors.top: inputField.bottom
++      anchors.topMargin: 56
++      anchors.horizontalCenter: inputField.horizontalCenter
++      spacing: 6
++      visible: root.voiceButtonVisible && root.inputEnabled
++      readonly property bool busy: root.voicePhase === "ask" || root.voicePhase === "listening" || root.voicePhase === "checking"
++      Rectangle {
++        width: 40; height: 40; radius: 20
++        anchors.horizontalCenter: parent.horizontalCenter
++        color: voiceButton.busy ? Qt.rgba(1, 1, 1, 0.42) : (micArea.containsMouse ? Qt.rgba(1, 1, 1, 0.30) : Qt.rgba(1, 1, 1, 0.18))
++        border.width: 1
++        border.color: Qt.rgba(1, 1, 1, 0.35)
++        SequentialAnimation on opacity {
++          running: voiceButton.busy; loops: Animation.Infinite
++          NumberAnimation { from: 1; to: 0.4; duration: 650 }
++          NumberAnimation { from: 0.4; to: 1; duration: 650 }
++        }
++        Text {
++          anchors.centerIn: parent
++          textFormat: Text.PlainText
++          text: String.fromCodePoint(0xF036C)
++          color: "#ffffff"
++          font.family: Style.font.family
++          font.pixelSize: 20
++        }
++        MouseArea {
++          id: micArea
++          anchors.fill: parent
++          hoverEnabled: true
++          cursorShape: Qt.PointingHandCursor
++          onClicked: if (!voiceButton.busy) root.voiceRequested()
++        }
++      }
++      Text {
++        anchors.horizontalCenter: parent.horizontalCenter
++        textFormat: Text.PlainText
++        text: root.voicePhase === "listening" ? "Listening…" : (root.voicePhase === "checking" ? "Checking…"
++              : (root.voicePhase === "miss" ? "Try again" : (root.voicePhase === "ask" ? "Say your voice password" : "Voice passcode")))
++        color: Commons.Color.lock.text
++        font.family: Style.font.family
++        font.pixelSize: Math.round(Style.font.heading * 0.8)
++      }
++    }
+   }
+ }
