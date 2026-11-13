@@ -47,6 +47,11 @@ OVERLAY_POLL_S = 0.2
 # Cold-launch and composer readiness (Grok Bot may not already be open).
 WINDOW_WAIT_S = 20.0
 COMPOSER_WAIT_S = 20.0
+# The whole "Starting voice…" stage is capped (the overlay plugin enforces the same 25 s).
+OVERLAY_START_MAX_S = 25.0
+# After clicking "Start voice chat", a NEW Grok Bot mic stream must appear within this time.
+VOICE_CONFIRM_S = 6.0
+DEBUG_SHOT = os.path.join(STATE, "last-handoff.png")
 MATCH_SCORE = 0.85
 MATCH_GLYPH = 0.75
 TEMPLATE_SCALES = (0.80, 0.90, 1.00, 1.10, 1.20)
@@ -374,28 +379,121 @@ def hypr_json(what):
         return None
 
 
+def hypr_lua(*exprs):
+    """Run Hyprland dispatchers. This Hyprland takes Lua (hl.dsp.*) through `hyprctl repl`."""
+    if not exprs:
+        return
+    sh(["hyprctl", "repl", " ".join(f"pcall(hl.dispatch, {e})" for e in exprs)], 3)
+
+
+def _waddr(addr):
+    return f'"address:{addr}"'
+
+
+def _is_grok(c):
+    return "grok" in (c.get("class") or "").lower()
+
+
 def grok_window():
+    """The main Grok Bot window: the focused one if Grok Bot is focused, else the largest."""
     aw = hypr_json("activewindow") or {}
-    if "grok" in (aw.get("class") or "").lower():
+    if _is_grok(aw) and aw.get("size"):
         return aw
-    for c in hypr_json("clients") or []:
-        if "grok" in (c.get("class") or "").lower():
-            return c
-    return None
+    wins = [c for c in hypr_json("clients") or [] if _is_grok(c) and c.get("size")]
+    if not wins:
+        return None
+    return max(wins, key=lambda c: c["size"][0] * c["size"][1])
 
 
-def grok_recording():
-    """True when the Grok Bot app has a microphone stream open (its voice chat is live)."""
+def hypr_find(addr):
+    return next((c for c in hypr_json("clients") or [] if c.get("address") == addr), None)
+
+
+def focused_monitor():
+    ms = hypr_json("monitors") or []
+    return next((m for m in ms if m.get("focused")), ms[0] if ms else None)
+
+
+def monitor_box(m):
+    """Logical (x, y, w, h) of a monitor: what hyprctl window coordinates and grim -g use."""
+    sc = float(m.get("scale") or 1.0)
+    w, h = m["width"], m["height"]
+    if int(m.get("transform") or 0) % 2 == 1:
+        w, h = h, w
+    return m["x"], m["y"], w / sc, h / sc
+
+
+def _on_screen(win, m):
+    mx, my, mw, mh = monitor_box(m)
+    (x, y), (w, h) = win["at"], win["size"]
+    ws = win.get("workspace") or {}
+    return (not str(ws.get("name", "")).startswith("special:")
+            and ws.get("id") == (m.get("activeWorkspace") or {}).get("id")
+            and x >= mx - 4 and y >= my - 4 and x + w <= mx + mw + 4 and y + h <= my + mh + 4)
+
+
+def bring_grok_forward(win, timeout_s=4.0):
+    """Put the Grok Bot window on the visible workspace, fully on screen, focused and settled.
+
+    Oma's Stage Manager parks apps that aren't on stage in special:oma-stage (and animates them
+    in from off screen), so a just-opened Grok Bot can be invisible to a screenshot. Ask Stage
+    Manager to promote it the same way a click in its strip does; fall back to moving it.
+    """
+    addr = win.get("address")
+    if not addr:
+        return win
+    m = focused_monitor()
+    if not m:
+        return win
+    ws = (m.get("activeWorkspace") or {}).get("name") or str((m.get("activeWorkspace") or {}).get("id", 1))
+    stage = os.path.join(HOME, ".local/bin/oma-stage")
+    if os.access(stage, os.X_OK):
+        sh([stage, "promote", win.get("class", "")], 3)
+    t0, last, nudged = time.time(), None, False
+    while time.time() - t0 < timeout_s:
+        time.sleep(0.25)
+        w = hypr_find(addr)
+        if not w:
+            return None
+        m = focused_monitor() or m
+        if str((w.get("workspace") or {}).get("name", "")).startswith("special:") and time.time() - t0 > 0.8:
+            hypr_lua(f'hl.dsp.window.move({{ workspace = "{ws}", follow = false, window = {_waddr(addr)} }})')
+            continue
+        geo = (tuple(w["at"]), tuple(w["size"]), (w.get("workspace") or {}).get("id"))
+        if _on_screen(w, m):
+            if geo == last:
+                if (hypr_json("activewindow") or {}).get("address") != addr:
+                    hypr_lua(f"hl.dsp.focus({{ window = {_waddr(addr)} }})")
+                return w
+        elif time.time() - t0 > 1.5 and not nudged and w.get("floating"):
+            # Stuck off screen (e.g. an interrupted Stage Manager animation): center it.
+            nudged = True
+            mx, my, mw, mh = monitor_box(m)
+            ww, wh = min(w["size"][0], int(mw * 0.9)), min(w["size"][1], int(mh * 0.9))
+            hypr_lua(f"hl.dsp.window.resize({{ x = {ww}, y = {wh}, relative = false, window = {_waddr(addr)} }})",
+                     f"hl.dsp.window.move({{ x = {int(mx + (mw - ww) / 2)}, y = {int(my + (mh - wh) / 2)}, relative = false, window = {_waddr(addr)} }})")
+        last = geo
+        hypr_lua(f"hl.dsp.focus({{ window = {_waddr(addr)} }})")
+    return hypr_find(addr) or win
+
+
+def _grok_props(p):
+    blob = " ".join(str(p.get(k, "")) for k in ("application.process.binary", "application.name"))
+    return "grok" in blob.lower()
+
+
+def grok_streams():
+    """Indexes of the Grok Bot app's open microphone streams (PipeWire source-outputs)."""
     try:
         outs = json.loads(sh(["pactl", "-f", "json", "list", "source-outputs"]) or "[]")
     except Exception:
-        return False
-    for o in outs:
-        p = o.get("properties", {})
-        blob = " ".join(str(p.get(k, "")) for k in ("application.process.binary", "application.name", "application.process.id"))
-        if "grok" in blob.lower() or str(p.get("application.process.binary", "")).lower() in ("grok-bot",):
-            return True
-    return False
+        return set()
+    return {o.get("index") for o in outs if _grok_props(o.get("properties", {}))}
+
+
+def grok_recording():
+    """True when the Grok Bot app has any microphone stream open."""
+    return bool(grok_streams())
 
 
 def overlay_visible():
@@ -412,14 +510,8 @@ def overlay_visible():
 def focus_grok():
     """Put keyboard focus back on the Grok Bot window after the overlay goes away."""
     win = grok_window() or {}
-    addr = win.get("address")
-    if not addr:
-        return
-    try:
-        subprocess.run(["hyprctl", "dispatch", "focuswindow", f"address:{addr}"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-    except Exception:
-        pass
+    if win.get("address"):
+        hypr_lua(f"hl.dsp.focus({{ window = {_waddr(win['address'])} }})")
 
 
 def hide_overlay():
@@ -697,93 +789,113 @@ def round_controls(img, band=130, contrast=8):
     return found
 
 
-def find_voice_button(img, band=130):
-    """Locate the voice-chat control in the composer row.
+def glyph_parts(img, c):
+    """Count the separate marks drawn inside a round control (its glyph).
 
-    Empty composer: one dark round control on the right (waveform). Draft present: a pale
-    mic button sits just left of the dark send arrow — return the mic, never the arrow.
-    Returns (cx, cy) in img coords or None.
-    """
-    ctrls = round_controls(img, band=band)
-    if not ctrls:
-        return None
-    right = ctrls[0]
-    # A neighbour just to the left of the right-most disc is the mic beside a draft's send button.
-    lefts = [c for c in ctrls[1:]
-             if abs(c["cy"] - right["cy"]) <= 12
-             and 0.6 * right["bw"] <= (right["cx"] - c["cx"]) <= 3.0 * right["bw"]]
-    if lefts:
-        mic = max(lefts, key=lambda c: c["cx"])
-        return mic["cx"], mic["cy"]
-    return right["cx"], right["cy"]
-
-
-def locate_voice_button(img, cal, ww, strip_h):
-    """Pick a click target. Returns (xy, how, kind) or (None, reason, None).
-
-    kind is 'empty' (dark waveform button) or 'draft' (mic beside send), used when relearning.
+    Grok Bot's composer has one call-to-action disc on the right: the "Start voice chat"
+    waveform (several separate bars) when the composer is empty, or the send arrow (one mark)
+    with the pale dictation mic beside it when there is a draft. Bars vs one mark tells them apart.
     """
     import numpy as np
-    hits = []
-
-    def consider(tpl, px, py, radius, label, kind):
-        score, inner, xy, scale = score_template(img, tpl, px, py, radius=radius)
-        hits.append((label, score, inner, xy, scale, kind))
-        return score, inner, xy, scale
-
-    if cal and cal.get("template") is not None:
-        tpl = np.array(cal["template"], dtype=np.float32)
-        px, py = ww - cal["fromRight"], strip_h - cal["fromBottom"]
-        score, inner, xy, scale = consider(tpl, px, py, 70, "template", "empty")
-        if xy and score >= MATCH_SCORE and inner >= MATCH_GLYPH:
-            return xy, f"template {score:.2f}/{inner:.2f}@{scale:.2f}", "empty"
-        # High outer / low glyph at the usual spot is the send arrow (a draft is in the composer).
-        # Only do a slow whole-strip search when the disc itself wasn't where we expected.
-        if not (xy and score >= MATCH_SCORE):
-            score, inner, xy, scale = consider(tpl, None, None, 70, "template-wide", "empty")
-            if xy and score >= MATCH_SCORE and inner >= MATCH_GLYPH:
-                return xy, f"template-wide {score:.2f}/{inner:.2f}@{scale:.2f}", "empty"
-        log("voice button match",
-            f"{hits[0][1]:.2f} / glyph {hits[0][2]:.2f}"
-            + (f", wide {score:.2f}/{inner:.2f}" if len(hits) > 1 else ""))
-
-    if cal and cal.get("templateDraft") is not None:
-        tpl = np.array(cal["templateDraft"], dtype=np.float32)
-        px, py = ww - cal["fromRightDraft"], strip_h - cal["fromBottomDraft"]
-        score, inner, xy, scale = consider(tpl, px, py, 90, "draft", "draft")
-        if not (xy and score >= MATCH_SCORE and inner >= MATCH_GLYPH):
-            score, inner, xy, scale = consider(tpl, None, None, 90, "draft-wide", "draft")
-        if xy and score >= MATCH_SCORE and inner >= MATCH_GLYPH:
-            return xy, f"draft-template {score:.2f}/{inner:.2f}@{scale:.2f}", "draft"
-
-    xy = find_voice_button(img)
-    if xy:
-        kind = "draft" if len(round_controls(img)) >= 2 else "empty"
-        return xy, "heuristic", kind
-    return None, "button-not-found", None
-
-
-def learn_button(img, cx, cy, ww, strip_h, kind="empty"):
-    """Save a 36x36 template. 'draft' is stored alongside the empty-composer button, not over it."""
-    x0, y0 = int(round(cx - 18)), int(round(cy - 18))
+    r = 0.36 * min(c["bw"], c["bh"])
+    y0, y1 = int(c["cy"] - r), int(c["cy"] + r) + 1
+    x0, x1 = int(c["cx"] - r), int(c["cx"] + r) + 1
     H, W = img.shape[:2]
-    if y0 < 0 or x0 < 0 or y0 + 36 > H or x0 + 36 > W:
-        return
-    tpl = img[y0:y0 + 36, x0:x0 + 36].round().astype(int).tolist()
-    rec = {}
+    if y0 < 0 or x0 < 0 or y1 > H or x1 > W:
+        return 0
+    g = img[y0:y1, x0:x1].mean(axis=2)
+    fill = float(np.median(g))
+    # Anti-aliased gaps between bars sit between the disc and the glyph colour: cut halfway.
+    far = float(g.max()) if abs(float(g.max()) - fill) >= abs(float(g.min()) - fill) else float(g.min())
+    if abs(far - fill) < 60:
+        return 0
+    mask = np.abs(g - fill) > 0.55 * abs(far - fill)
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    mask &= (xx - c["cx"]) ** 2 + (yy - c["cy"]) ** 2 <= r * r
+    seen = np.zeros_like(mask)
+    parts = 0
+    for y, x in zip(*np.nonzero(mask)):
+        if seen[y, x]:
+            continue
+        parts_n, stack = 0, [(y, x)]
+        seen[y, x] = True
+        while stack:
+            a, b = stack.pop(); parts_n += 1
+            for aa, bb in ((a + 1, b), (a - 1, b), (a, b + 1), (a, b - 1)):
+                if 0 <= aa < mask.shape[0] and 0 <= bb < mask.shape[1] and mask[aa, bb] and not seen[aa, bb]:
+                    seen[aa, bb] = True; stack.append((aa, bb))
+        if parts_n >= 3:
+            parts += 1
+    return parts
+
+
+def find_voice_button(img, band=130):
+    """Classify the composer's right-hand call-to-action.
+
+    Returns (kind, (cx, cy) or None, detail):
+      voice    the "Start voice chat" waveform button (safe to click)
+      draft    the send arrow: a draft is in the composer, so Grok Bot shows no voice-chat button
+               (the pale mic beside it is dictation, not voice chat, and is never clicked)
+      none     no composer controls found yet
+    """
+    # The call-to-action sits at the right end of the composer: look only at the right half, so
+    # the sidebar doesn't skew the background estimate.
+    x_off = img.shape[1] // 2 if img.shape[1] >= 400 else 0
+    ctrls = round_controls(img[:, x_off:], band=band)
+    for c in ctrls:
+        c["cx"] += x_off
+    if not ctrls:
+        return "none", None, "no controls"
+    cta = ctrls[0]
+    parts = glyph_parts(img, cta)
+    beside = [c for c in ctrls[1:] if abs(c["cy"] - cta["cy"]) <= 12
+              and 0.6 * cta["bw"] <= (cta["cx"] - c["cx"]) <= 3.0 * cta["bw"]]
+    detail = f"cta at {cta['cx']:.0f},{cta['cy']:.0f} {cta['bw']}x{cta['bh']} marks={parts} beside={len(beside)}"
+    if parts >= 3:
+        return "voice", (cta["cx"], cta["cy"]), detail
+    if beside:
+        return "draft", None, detail
+    return "none", None, detail
+
+
+def save_png(path, img):
+    """Write an HxWx3 array as PNG (no PIL needed). For the hand-off diagnosis screenshot."""
+    import numpy as np, zlib, struct
+    a = np.clip(img, 0, 255).astype(np.uint8)
+    h, w = a.shape[:2]
+    raw = b"".join(b"\x00" + a[y].tobytes() for y in range(h))
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 3)) + chunk(b"IEND", b""))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def shoot_window(win, tag=""):
+    """grim the Grok Bot window's real geometry (clipped to its monitor). The overlay must already
+    be hidden (setCapture). Returns (img, rx, ry, k): k = image pixels per logical pixel."""
+    m = focused_monitor()
+    mx, my, mw, mh = monitor_box(m) if m else (0, 0, 10 ** 5, 10 ** 5)
+    (wx, wy), (ww, wh) = win["at"], win["size"]
+    x0, y0 = max(wx, mx), max(wy, my)
+    x1, y1 = min(wx + ww, mx + mw), min(wy + wh, my + mh)
+    if x1 - x0 < 200 or y1 - y0 < 150:
+        raise RuntimeError(f"Grok Bot window is off screen (at {wx},{wy} size {ww}x{wh})")
+    x0, y0, rw, rh = int(x0), int(y0), int(x1 - x0), int(y1 - y0)
+    raw = subprocess.run(["grim", "-g", f"{x0},{y0} {rw}x{rh}", "-t", "ppm", "-"], capture_output=True, timeout=5).stdout
+    img = load_ppm(raw)
+    k = img.shape[1] / float(rw)
     try:
-        with open(CALIB) as f:
-            rec = json.load(f)
-    except Exception:
-        pass
-    now = int(time.time())
-    if kind == "draft":
-        rec.update({"fromRightDraft": ww - cx, "fromBottomDraft": strip_h - cy,
-                    "templateDraft": tpl, "learnedDraft": now})
-    else:
-        rec.update({"fromRight": ww - cx, "fromBottom": strip_h - cy,
-                    "template": tpl, "learned": now})
-    write_private(CALIB, json.dumps(rec))
+        save_png(DEBUG_SHOT, img)
+        if tag:
+            save_png(DEBUG_SHOT.replace(".png", f"-{tag}.png"), img)
+    except Exception as e:
+        log("debug screenshot not saved:", e)
+    return img, x0, y0, k
 
 
 def launch_grok(url):
@@ -792,21 +904,16 @@ def launch_grok(url):
     return shutil.which("grok-bot") or ("/usr/bin/grok-bot" if os.path.isfile("/usr/bin/grok-bot") else None)
 
 
-def wait_for_grok_window(timeout_s=WINDOW_WAIT_S, url=None, bin_path=None):
-    """Poll Hyprland clients (not just the active window) until Grok Bot is mapped, up to timeout_s.
-
-    If the window still isn't up after 3 seconds and bin_path is set, start grok-bot with the URL
-    (a second launch of the already-running app just focuses it).
-    """
+def wait_for_grok_window(timeout_s=WINDOW_WAIT_S, url=None, bin_path=None, wanted=None):
+    """Poll Hyprland clients until a Grok Bot window exists (any workspace, incl. Stage Manager's)."""
     t0 = time.time()
     launched_bin = False
     while time.time() - t0 < timeout_s:
+        if wanted and not wanted():
+            return None
         time.sleep(0.3)
-        win = grok_window() or {}
-        if win.get("mapped") and not win.get("hidden"):
-            return win
-        # Also accept a window that has a size even if 'mapped' is missing from older hyprctl.
-        if win.get("size") and not win.get("hidden"):
+        win = grok_window()
+        if win and win.get("size") and win["size"][0] > 200:
             return win
         if (not launched_bin) and bin_path and url and (time.time() - t0 >= 3.0):
             launched_bin = True
@@ -817,83 +924,97 @@ def wait_for_grok_window(timeout_s=WINDOW_WAIT_S, url=None, bin_path=None):
     return None
 
 
-def grab_composer(win):
-    (wx, wy), (ww, wh) = win["at"], win["size"]
-    strip_h = min(260, wh)
-    sy = wy + wh - strip_h
-    shell_ipc("setCapture", "true")
-    time.sleep(0.18)
-    try:
-        img = grab(wx, sy, ww, strip_h)
-    finally:
-        shell_ipc("setCapture", "false")
-    return img, wx, wy, ww, wh, strip_h, sy
+def start_voice(cfg, agent, wanted=None, deadline=None):
+    """Open the agent's chat (cold-launching Grok Bot if needed) and press "Start voice chat".
 
-
-def start_voice(cfg, agent):
-    """Open the agent's chat (cold-launching Grok Bot if needed) and press its voice button."""
+    Returns (outcome, new_mic_streams). outcome: voice-live | draft | button-not-found |
+    clicked-unconfirmed | no-window | dismissed | opened | no-agent-id.
+    voice-live means a NEW Grok Bot microphone stream appeared after our click.
+    """
+    wanted = wanted or (lambda: True)
+    deadline = deadline or (time.time() + OVERLAY_START_MAX_S - 2)
     aid = agent.get("agentId", "")
     if not aid or "TODO" in aid:
         notify(f"Hey {agent.get('name')}", "This agent's Grok Bot id isn't set yet (Settings > Voice Wake).")
-        return "no-agent-id"
+        return "no-agent-id", set()
     url = cfg.get("openUrl", DEFAULTS["openUrl"]).replace("{id}", aid)
+    was_open = grok_window() is not None
     bin_path = launch_grok(url)
     if not cfg.get("startVoice", True):
-        return "opened"
-    win = wait_for_grok_window(WINDOW_WAIT_S, url=url, bin_path=bin_path)
+        return "opened", set()
+    win = wait_for_grok_window(min(WINDOW_WAIT_S, max(1, deadline - time.time())), url=url, bin_path=bin_path, wanted=wanted)
+    if not wanted():
+        return "dismissed", set()
     if not win:
-        return "no-window"
-    if grok_recording():
-        return "already-live"
+        return "no-window", set()
+    if not was_open:
+        time.sleep(1.5)  # cold launch: let it route to the agent's chat before we look
+    settle = float(cfg.get("settleMs", 1400)) / 1000.0
 
-    cal = None
-    try:
-        with open(CALIB) as f:
-            cal = json.load(f)
-    except Exception:
-        pass
-
-    target, how, kind = None, "", None
-    img = wx = sy = ww = strip_h = None
-    t1 = time.time()
-    while True:
-        win = grok_window() or win
-        try:
-            img, wx, wy, ww, wh, strip_h, sy = grab_composer(win)
-        except Exception as e:
-            log("composer grab failed:", e)
-            img = None
-        if img is not None:
-            if grok_recording():
-                return "already-live"
-            target, how, kind = locate_voice_button(img, cal, ww, strip_h)
+    # Grok Bot keeps showing the previous chat for a moment after the link: never judge before this.
+    if was_open:
+        time.sleep(1.8)
+    for attempt in (1, 2):
+        before = grok_streams()
+        target, seen_at, kind, detail = None, None, "none", ""
+        draft_since = None
+        while True:
+            if not wanted():
+                return "dismissed", set()
+            if time.time() >= deadline:
+                break
+            win = bring_grok_forward(grok_window() or win) or win
+            shell_ipc("setCapture", "true")
+            time.sleep(0.2)
+            try:
+                img, rx, ry, k = shoot_window(win, tag=f"try{attempt}")
+                kind, xy, detail = find_voice_button(img, band=int(160 * k))
+                if kind == "voice":
+                    pos = (rx + xy[0] / k, ry + xy[1] / k)
+                    # Require the same spot on two shots in a row so a half-rendered or
+                    # still-routing window is never clicked.
+                    if seen_at and abs(seen_at[0] - pos[0]) <= 4 and abs(seen_at[1] - pos[1]) <= 4:
+                        target = pos
+                        subprocess.run([VCLICK, str(int(round(pos[0]))), str(int(round(pos[1])))], timeout=5)
+                    seen_at = pos
+                else:
+                    seen_at = None
+            except Exception as e:
+                log("screenshot failed:", e)
+                kind = "none"
+            finally:
+                shell_ipc("setCapture", "false")
             if target:
                 break
-        if time.time() - t1 >= COMPOSER_WAIT_S:
+            if kind == "draft":
+                # Only believe "draft" once it has held for 2 s: the previous chat may still be on screen.
+                draft_since = draft_since or time.time()
+                if time.time() - draft_since >= 2.0:
+                    break
+            else:
+                draft_since = None
+            time.sleep(0.35)
+        log(f"voice button (try {attempt}):", kind, detail, "-> clicked" if target else "")
+        if kind == "draft":
+            return "draft", set()
+        if target is None:
+            return "button-not-found", set()
+        # Confirm: a NEW Grok Bot mic stream (not one that was already open before the click).
+        new = set()
+        t0 = time.time()
+        while time.time() - t0 < VOICE_CONFIRM_S:
+            time.sleep(0.25)
+            new = grok_streams() - before
+            if new:
+                break
+        if new:
+            log("voice live: new Grok Bot mic stream", sorted(new))
+            return "voice-live", new
+        log(f"voice button (try {attempt}): no new mic stream within {VOICE_CONFIRM_S:.0f}s")
+        if time.time() + VOICE_CONFIRM_S + 2 > deadline:
             break
-        time.sleep(0.4)
-
-    if target is None:
-        return "button-not-found"
-    cx, cy = target
-    subprocess.run([VCLICK, str(int(wx + cx)), str(int(sy + cy))], timeout=5)
-    ok = False
-    for _ in range(16):
-        time.sleep(0.25)
-        if grok_recording():
-            ok = True
-            break
-    if ok:
-        # Relearn only after a confirmed mic stream, and never overwrite the other state's template.
-        if kind == "draft" and (how == "heuristic" or how.startswith("draft")):
-            learn_button(img, cx, cy, ww, strip_h, kind="draft")
-        elif kind == "empty" and (how == "heuristic" or not cal or cal.get("template") is None):
-            learn_button(img, cx, cy, ww, strip_h, kind="empty")
-        elif kind == "empty" and how == "heuristic" and cal:
-            # Template missed (scale / layout) but the heuristic found the empty-state button.
-            learn_button(img, cx, cy, ww, strip_h, kind="empty")
-    log("voice button:", how, "->", "voice live" if ok else "no mic stream seen")
-    return "voice-live" if ok else "clicked-unconfirmed"
+        time.sleep(settle / 2)
+    return "clicked-unconfirmed", set()
 
 
 def _draw_disc(img, cx, cy, r, color):
@@ -927,72 +1048,69 @@ def _synthetic_composer(kind):
         return img, (mic_cx, cy)
     # empty composer: one dark waveform disc on the right
     _draw_disc(img, send_cx, cy, r, (28, 28, 28))
-    for dx in range(-5, 6):
-        h = 3 + int(3 * abs((dx % 3) - 1))
-        img[int(cy - h):int(cy + h) + 1, int(send_cx + dx)] = 220
+    for dx, h in ((-6, 2), (-3, 4), (0, 6), (3, 4), (6, 2)):  # separate waveform bars
+        img[int(cy - h):int(cy + h) + 1, int(send_cx + dx):int(send_cx + dx) + 2] = 220
     return img, (send_cx, cy)
 
 
 def test_find_button(path=None):
-    """Dry-run the locator. With no args, uses synthetic composer strips. Optional PPM path."""
-    import numpy as np
+    """Dry-run the locator on synthetic composer strips (and optionally a PNG/PPM screenshot)."""
     cases = []
 
-    def check(name, img, expect, tol=8):
-        xy = find_voice_button(img)
-        ok = xy is not None and abs(xy[0] - expect[0]) <= tol and abs(xy[1] - expect[1]) <= tol
-        cases.append((ok, name, expect, xy))
-        print(("ok" if ok else "FAIL") + f": {name} -> {xy} (expected near {expect})")
-
-    img, expect = _synthetic_composer("draft")
-    check("synthetic draft: mic left of send, not the arrow", img, expect)
-    # The right-most disc must not be returned as the click target when a mic sits beside it.
-    ctrls = round_controls(img)
-    if len(ctrls) >= 2 and expect[0] < ctrls[0]["cx"]:
-        cases.append((True, "draft has two controls and send is to the right", None, None))
-        print("ok: draft has two controls and send is to the right")
-    else:
-        cases.append((False, "draft has two controls and send is to the right", "2 ctrls, send right of mic", ctrls))
-        print("FAIL: draft controls", [(round(c["cx"], 1), round(c["cy"], 1), c["bw"], c["bh"]) for c in ctrls])
+    def check(name, img, expect_kind, expect_xy=None, tol=8):
+        kind, xy, detail = find_voice_button(img)
+        ok = kind == expect_kind and (expect_xy is None or (xy and abs(xy[0] - expect_xy[0]) <= tol
+                                                             and abs(xy[1] - expect_xy[1]) <= tol))
+        cases.append(ok)
+        print(("ok" if ok else "FAIL") + f": {name} -> {kind} {xy} ({detail})")
 
     img, expect = _synthetic_composer("empty")
-    check("synthetic empty: the lone dark waveform disc", img, expect)
-
-    # A learned waveform template must reject the send arrow (high outer / low glyph).
-    empty, _ = _synthetic_composer("empty")
-    draft, _ = _synthetic_composer("draft")
-    ex, ey = 340.0, 100.0
-    tpl = empty[int(ey - 18):int(ey + 18), int(ex - 18):int(ex + 18)]
-    score, inner, xy = match_template(draft, tpl, ex, ey, radius=40)
-    ok = inner < MATCH_GLYPH
-    cases.append((ok, "send arrow fails glyph check", f"inner<{MATCH_GLYPH}", f"{score:.2f}/{inner:.2f} at {xy}"))
-    print(("ok" if ok else "FAIL") + f": send arrow fails glyph check -> {score:.2f}/{inner:.2f} at {xy}")
-
+    check("empty composer: click the waveform (Start voice chat)", img, "voice", expect)
+    img, _ = _synthetic_composer("draft")
+    check("draft: send arrow + dictation mic, never clicked", img, "draft")
+    import numpy as np
+    check("blank window: nothing to click", np.full((130, 400, 3), 252.0, dtype=np.float32), "none")
     if path:
         raw = open(path, "rb").read()
         if raw.startswith(b"P6"):
             shot = load_ppm(raw)
         else:
-            raise SystemExit(f"test-find-button: {path} is not a binary PPM (convert with: ffmpeg -i src.png -c:v ppm dst.ppm)")
-        xy = find_voice_button(shot)
-        print(f"file {path}: {shot.shape[1]}x{shot.shape[0]} -> {xy}")
-        # If the strip looks like a draft (two right-side controls), the click target must be
-        # the left of the right-most pair, not the send arrow.
-        ctrls = [c for c in round_controls(shot) if c["cx"] > shot.shape[1] * 0.5]
-        if len(ctrls) >= 2 and xy is not None:
-            send = max(ctrls, key=lambda c: c["cx"])
-            ok = xy[0] < send["cx"] - 8
-            cases.append((ok, f"file draft: clicked left of send ({send['cx']:.0f})", True, xy))
-            print(("ok" if ok else "FAIL") + f": file draft -> {xy} (send at {send['cx']:.0f},{send['cy']:.0f})")
-        elif xy is None:
-            cases.append((False, "file: no control found", "a button", None))
-            print("FAIL: file: no control found")
-        else:
-            print(f"(file has {len(ctrls)} right-side control(s); not treated as a draft pair)")
+            shot = load_png(raw)
+        kind, xy, detail = find_voice_button(shot, band=min(shot.shape[0], 200))
+        print(f"file {path}: {shot.shape[1]}x{shot.shape[0]} -> {kind} {xy} ({detail})")
+    print(f"{sum(cases)}/{len(cases)} passed")
+    return 0 if all(cases) else 1
 
-    failed = [c for c in cases if not c[0]]
-    print(f"{len(cases) - len(failed)}/{len(cases)} passed")
-    return 0 if not failed else 1
+
+def load_png(raw):
+    """Minimal 8-bit RGB/RGBA non-interlaced PNG reader (for test-find-button on saved shots)."""
+    import numpy as np, zlib, struct
+    pos, idat, w = 8, b"", 0
+    while pos < len(raw):
+        n, t = struct.unpack(">I4s", raw[pos:pos + 8]); d = raw[pos + 8:pos + 8 + n]; pos += 12 + n
+        if t == b"IHDR":
+            w, h, depth, ctype = struct.unpack(">IIBB", d[:10])
+        elif t == b"IDAT":
+            idat += d
+    ch = {2: 3, 6: 4}[ctype]
+    data = zlib.decompress(idat); stride = w * ch
+    out = np.zeros((h, stride), dtype=np.int32); prev = np.zeros(stride, dtype=np.int32)
+    for y in range(h):
+        f = data[y * (stride + 1)]; row = np.frombuffer(data[y * (stride + 1) + 1:(y + 1) * (stride + 1)], dtype=np.uint8).astype(np.int32)
+        if f == 0: cur = row
+        elif f == 2: cur = (row + prev) & 255
+        else:
+            cur = np.zeros(stride, dtype=np.int32)
+            for x in range(stride):
+                a = cur[x - ch] if x >= ch else 0; b = prev[x]; c = prev[x - ch] if x >= ch else 0
+                if f == 1: p = a
+                elif f == 3: p = (a + b) // 2
+                else:
+                    pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                    p = a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+                cur[x] = (row[x] + p) & 255
+        out[y] = cur; prev = cur
+    return out.reshape(h, w, ch)[:, :, :3].astype(np.float32)
 
 
 class Listener:
@@ -1204,36 +1322,47 @@ class Listener:
             notify(f"Hey {name}", "This agent's Grok Bot id isn't set yet (Settings > Voice Wake > Agents).")
             log("hand-off:", name, "no agent id")
             return
-        if self.cfg.get("overlay", True):
+        overlay = self.cfg.get("overlay", True)
+        self._overlay_gen += 1  # cancels any older overlay watcher
+        t_start = time.time()
+        if overlay:
             shell_ipc("show", json.dumps({"name": name}))
             self.level_until = time.time() + 600
+        # The overlay's own Esc / mouse / key dismissal (or its 25 s cap) aborts the hand-off.
+        wanted = (lambda: overlay_visible() is not False) if overlay else (lambda: True)
         try:
-            outcome = start_voice(self.cfg, agent)
+            outcome, streams = start_voice(self.cfg, agent, wanted=wanted, deadline=t_start + OVERLAY_START_MAX_S - 2)
         except Exception as e:
-            outcome = f"error: {e}"
-        log("hand-off:", name, outcome)
-        hide_now = outcome in ("button-not-found", "no-window") or outcome.startswith("error")
-        if hide_now and self.cfg.get("overlay", True):
-            # Don't leave John on the black "move the mouse" screen when the click never happened.
+            outcome, streams = f"error: {e}", set()
+        log("hand-off:", name, outcome, f"({time.time() - t_start:.1f}s)")
+        if outcome == "voice-live":
+            if overlay:
+                shell_ipc("setLive", "true")
+                self.watch_overlay_end(streams)
+            return
+        self.level_until = 0
+        if overlay:
             hide_overlay()
-        elif self.cfg.get("overlay", True):
-            shell_ipc("setLive", "true")
-            already_live = outcome in ("voice-live", "already-live")
-            self.watch_overlay_end(already_live)
-        if outcome == "button-not-found":
+        else:
+            focus_grok()
+        if outcome == "draft":
+            notify(f"Hey {name}", "There's an unsent message in this chat, so Grok Bot hides its voice button. "
+                                  "Send or clear it, then click the voice button (or say the wake phrase again).")
+        elif outcome in ("button-not-found", "clicked-unconfirmed") or outcome.startswith("error"):
             notify(f"Hey {name}", "Click the voice button to talk")
         elif outcome == "no-window":
             notify(f"Hey {name}", "Grok Bot didn't open. Open it and click the voice button to talk.")
-        elif outcome == "clicked-unconfirmed" or outcome.startswith("error"):
-            notify(f"Hey {name}", "Opened the chat. Click the voice button to talk (I couldn't start voice by myself).")
 
-    def watch_overlay_end(self, already_live):
-        """While the overlay is up, hide it when Grok Bot's voice chat ends (or never starts)."""
-        self._overlay_gen += 1
+    def watch_overlay_end(self, streams):
+        """While the overlay is up, hide it once the voice chat's own mic stream(s) are gone."""
         gen = self._overlay_gen
+        streams = set(streams or ())
+
+        def recording():
+            return bool(grok_streams() & streams) if streams else grok_recording()
 
         def watcher():
-            reason = watch_for_voice_end(already_live=already_live,
+            reason = watch_for_voice_end(already_live=True, recording_fn=recording,
                                          stop_fn=lambda: gen != self._overlay_gen)
             if gen != self._overlay_gen:
                 return

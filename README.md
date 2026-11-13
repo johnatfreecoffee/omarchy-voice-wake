@@ -7,13 +7,14 @@ Say **"Hey &lt;agent name&gt;"** and talk to your own Grok Bot agent, on [Omarch
 - **Unlocked:** the screen goes black with the full Grok Bot head rocking inside a large white
   circle, and a green-to-blue bar waveform under it moves with your voice, like a phone-call
   visualizer. Grok Bot opens that agent (it will launch the app if it isn't already running,
-  and wait up to 20 seconds for the window and composer to finish loading) and starts voice
-  chat. If a draft is in the composer, it clicks the mic button to the left of the send arrow,
-  not the arrow itself. When the voice chat ends (the app closes its microphone), the black
-  screen hides itself and focus goes back to Grok Bot. Move the mouse or press any key to
-  clear it sooner; Grok Bot stays in front. If the voice button can't be found, the overlay
-  hides immediately and a notification says to click the voice button to talk. If a click
-  was attempted but voice never actually starts, the overlay gives up after about 20 seconds.
+  bring its window onto the visible workspace, even from Oma's Stage Manager strip) and starts
+  voice chat. When the voice chat ends (the app closes its microphone), the black screen hides
+  itself and focus goes back to Grok Bot. Esc, any key, a click or a mouse move clears it at
+  any time, including while it still says "Starting voice…", and it never stays on "Starting
+  voice…" longer than 25 seconds. If the chat has an unsent draft, Grok Bot hides its voice-chat
+  button (the mic beside the send arrow is dictation), so nothing is clicked: the overlay hides
+  and a notification asks you to send or clear the draft. If voice can't be confirmed, the
+  overlay hides and a notification says to click the voice button to talk.
 - **Locked** (with the optional [lock integration](lock-integration/README.md)): it asks
   *"What's your voice password?"*, checks what you say on-device, unlocks, then does the above.
   A mic button on the lock screen does the same check on click. Only on Wi-Fi networks you trust;
@@ -65,20 +66,20 @@ Read [SECURITY.md](SECURITY.md) first: a spoken word is weak security.
 
 ## How voice chat gets started (and why it's fragile)
 
-Grok Bot has no link that starts voice mode. The listener opens the agent with
-`xdg-open grokbot://app/v1/agent?id=…`, waits for the window, hides the overlay for one screenshot of
-the composer strip (`grim`), finds the round voice (waveform) button there, and clicks it with
-`oma-vclick`. The first successful press is remembered (a 36×36 template and its offset from the
-window corner, in `~/.local/state/oma-voice-wake/voice-button.json`). After that a match must score high
-on both the button and the waveform glyph, so the send arrow (when the composer holds a draft) is
-never clicked. It counts as started when Grok Bot opens a microphone stream (`pactl`). When anything
-doesn't match (a draft, another theme, an app update) it does not guess: the chat is open and a
-notification asks you to click the voice button. `oma-voice-wake forget-button` relearns it.
+Grok Bot has no link or shortcut that starts voice mode. The listener opens the agent with
+`xdg-open grokbot://app/v1/agent?id=…`, waits for the window, asks Oma's Stage Manager to promote it
+(or moves it out of `special:oma-stage`), focuses it and waits for its position to settle. Then it
+hides the overlay, screenshots the window's real geometry from `hyprctl` with `grim` (saved to
+`~/.local/state/oma-voice-wake/last-handoff.png`), and looks at the composer's right-hand button:
+the "Start voice chat" waveform (several separate bars) is clicked with `oma-vclick`, but only after
+two shots in a row agree on its position; the send arrow means a draft, and nothing is clicked.
+It counts as started only when a NEW Grok Bot microphone stream appears within 6 seconds of the
+click (`pactl`, compared with the streams open before). Otherwise it retries once, then hides the
+overlay, focuses Grok Bot and notifies "Click the voice button to talk".
 
-While the overlay is up, the listener keeps watching that same microphone stream. Once it has
+While the overlay is up, the listener keeps watching that same new microphone stream. Once it has
 been gone for about 1.5 seconds — you said goodbye, or you hung up — the overlay hides and
-Grok Bot is focused again. If a stream never appears within about 20 seconds of the hand-off,
-the overlay hides anyway. Mouse move and any key still dismiss it immediately.
+Grok Bot is focused again. Esc, any key, a click or a mouse move still dismiss it immediately.
 `oma-voice-wake test-end-monitor` dry-runs this logic with a fake clock and a scripted mic
 (no wake, no overlay, no click).
 

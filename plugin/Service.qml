@@ -1,7 +1,9 @@
 // Voice Wake overlay. The oma-voice-wake listener drives it over the shell IPC target "voicewake":
 //   show '{"name":"Jack"}'   black full-screen overlay with the head in a white circle (click-through)
 //   setCapture true|false    hide it for one screenshot while the listener finds Grok Bot's voice button
-//   setLive true             from now on a mouse move or any key dismisses it
+//   setLive true             voice chat is live (the overlay stays until the chat ends)
+// A mouse move, click, wheel, Esc or any key dismisses it at every stage, including
+// "Starting voice…". While not live it also gives up on its own after 25 s.
 //   hide / isVisible
 // The official Grok Bot icon is a cropped close-up of the head (chin and left side clipped).
 // install.sh rebuilds head.png as the full head, centered, so it sits inside the disc with padding.
@@ -28,6 +30,17 @@ Item {
   property string agentName: ""
   property real level: 0
   property double liveAt: 0
+  // Input before this time is ignored (overlay just appeared, or a capture just ended and the
+  // listener's virtual pointer moved underneath us).
+  property double armedAt: 0
+
+  function arm(ms) {
+    root.armedAt = Date.now() + ms
+    root.lastX = -1
+    root.lastY = -1
+  }
+  property real lastX: -1
+  property real lastY: -1
 
   function showOverlay(payload) {
     var name = ""
@@ -37,10 +50,14 @@ Item {
     root.capturing = false
     root.level = 0
     root.shown = true
-    safetyTimer.restart()
+    root.arm(700)
+    liveTimer.stop()
+    startTimer.restart()
   }
 
   function dismiss() {
+    startTimer.stop()
+    liveTimer.stop()
     root.shown = false
     root.live = false
     root.capturing = false
@@ -54,14 +71,29 @@ Item {
     function setLive(on: string): string {
       root.live = (on === "true" || on === "1")
       root.liveAt = Date.now()
+      root.arm(600)
+      if (root.live) { startTimer.stop(); liveTimer.restart() }
       return "ok"
     }
-    function setCapture(on: string): string { root.capturing = (on === "true" || on === "1"); return "ok" }
+    function setCapture(on: string): string {
+      var c = (on === "true" || on === "1")
+      root.capturing = c
+      if (!c) root.arm(500)
+      return "ok"
+    }
     function isVisible(): string { return root.shown ? "true" : "false" }
   }
 
-  // Never leave the screen black: give up after ten minutes regardless.
-  Timer { id: safetyTimer; interval: 600000; onTriggered: root.dismiss() }
+  // Never leave the screen black: 25 s at most while voice is still starting, and ten
+  // minutes at most once the voice chat is live.
+  Timer { id: startTimer; interval: 25000; onTriggered: root.dismiss() }
+  Timer { id: liveTimer; interval: 600000; onTriggered: root.dismiss() }
+
+  function userInput() {
+    if (!root.shown || root.capturing || Date.now() < root.armedAt) return false
+    root.dismiss()
+    return true
+  }
 
   FileView { id: levelFile; path: root.runDir + "/level"; printErrors: false; blockLoading: true }
   Timer {
@@ -90,30 +122,26 @@ Item {
       exclusionMode: ExclusionMode.Ignore
       WlrLayershell.namespace: "oma-voice-wake"
       WlrLayershell.layer: WlrLayer.Overlay
-      WlrLayershell.keyboardFocus: root.live ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
-      // Click-through until live, so the listener can press Grok Bot's voice button underneath.
-      mask: root.live ? null : noInput
-      Region { id: noInput }
+      // Always takes the keyboard and pointer so Esc / any key / the mouse can dismiss it. The
+      // listener hides it (setCapture) for the moment it screenshots and clicks Grok Bot.
+      WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
 
       Item {
         id: content
         anchors.fill: parent
         focus: true
-        Keys.onPressed: function(event) { if (root.live) { root.dismiss(); event.accepted = true } }
+        Keys.onPressed: function(event) { if (root.userInput()) event.accepted = true }
 
-        property real lastX: -1
-        property real lastY: -1
         MouseArea {
           anchors.fill: parent
           hoverEnabled: true
           acceptedButtons: Qt.AllButtons
           onPositionChanged: function(mouse) {
-            if (!root.live || Date.now() - root.liveAt < 600) { content.lastX = mouse.x; content.lastY = mouse.y; return }
-            if (content.lastX < 0) { content.lastX = mouse.x; content.lastY = mouse.y; return }
-            if (Math.abs(mouse.x - content.lastX) + Math.abs(mouse.y - content.lastY) > 6) root.dismiss()
+            if (Date.now() < root.armedAt || root.lastX < 0) { root.lastX = mouse.x; root.lastY = mouse.y; return }
+            if (Math.abs(mouse.x - root.lastX) + Math.abs(mouse.y - root.lastY) > 6) root.userInput()
           }
-          onPressed: if (root.live) root.dismiss()
-          onWheel: function(w) { if (root.live) root.dismiss() }
+          onPressed: root.userInput()
+          onWheel: function(w) { root.userInput() }
         }
 
         Column {
@@ -228,7 +256,7 @@ Item {
           anchors.bottom: parent.bottom
           anchors.bottomMargin: 36
           textFormat: Text.PlainText
-          text: root.live ? "Move the mouse or press any key to see Grok Bot" : "Starting voice…"
+          text: root.live ? "Move the mouse or press any key to see Grok Bot" : "Starting voice…   Press Esc or move the mouse to cancel"
           color: Qt.rgba(1, 1, 1, 0.45)
           font.pixelSize: 13
         }
