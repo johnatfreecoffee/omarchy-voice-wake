@@ -44,6 +44,13 @@ CHUNK = 1600  # 100 ms of 16-bit mono
 OVERLAY_MIC_GONE_S = 1.5
 OVERLAY_MIC_APPEAR_S = 20.0
 OVERLAY_POLL_S = 0.2
+# The call counts as over only when Grok Bot has no mic stream AND the speakers have been quiet
+# for this long. Grok Bot may pause or reopen its mic while the bot talks; that must not end it.
+CALL_END_S = 4.0
+BOT_ACTIVE_S = 1.2
+LIVE_SOUND = os.path.join(APP, "sounds/live.wav")
+METER_FPS = 30
+METER_BANDS = 16
 # Cold-launch and composer readiness (Grok Bot may not already be open).
 WINDOW_WAIT_S = 20.0
 COMPOSER_WAIT_S = 20.0
@@ -221,6 +228,8 @@ class Mic(threading.Thread):
         super().__init__(daemon=True)
         self.q = queue.Queue(maxsize=200)
         self.level = 0.0
+        self.tail = b""
+        self.tail_at = 0.0
         self.proc = None
 
     def run(self):
@@ -240,10 +249,12 @@ class Mic(threading.Thread):
                                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             buf = b""
             while True:
-                data = self.proc.stdout.read(CHUNK * 2)
+                data = self.proc.stdout.read(1024)  # 32 ms: keeps the waveform tail fresh
                 if not data:
                     break
                 buf += data
+                self.tail = (self.tail + data)[-2048:]
+                self.tail_at = time.time()
                 while len(buf) >= CHUNK * 2:
                     c, buf = buf[:CHUNK * 2], buf[CHUNK * 2:]
                     rms = rms_of(c)
@@ -264,6 +275,146 @@ class Mic(threading.Thread):
                 self.q.get_nowait()
             except queue.Empty:
                 break
+
+
+class Meter:
+    """Live spectrum for the overlay waveform, ~30 fps, while the overlay is up.
+
+    You: the wake listener's own mic stream (Mic.tail). The bot: the default sink's monitor,
+    read with parec. Each frame writes one line to $RUN/level:
+        <user|bot> <overall 0..1> <16 band levels 0..1, low to high>
+    """
+
+    def __init__(self, mic):
+        import numpy as np
+        self.np = np
+        self.mic = mic
+        self.until = 0.0
+        self.mon_tail = b""
+        self.mon_at = 0.0
+        self.mon_proc = None
+        self.bot_at = 0.0
+        self.floor = None
+        self.win = np.hanning(1024).astype(np.float32)
+        f = np.fft.rfftfreq(1024, 1 / RATE)
+        edges = np.geomspace(90, 6000, METER_BANDS + 1)
+        self.ranges = []
+        for i in range(METER_BANDS):
+            lo = int(np.searchsorted(f, edges[i]))
+            hi = max(lo + 1, int(np.searchsorted(f, edges[i + 1])))
+            self.ranges.append((lo, hi))
+        self.tilt = np.linspace(0, 10, METER_BANDS)  # speech is weaker up high
+
+    def active(self):
+        return time.time() < self.until
+
+    def start(self, secs=900):
+        self.until = time.time() + secs
+        self.bot_at = 0.0
+
+    def stop(self):
+        self.until = 0.0
+        p = self.mon_proc
+        if p:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        self._write("user 0.000 " + " ".join(["0.000"] * METER_BANDS))
+
+    def bot_recent(self, s=BOT_ACTIVE_S):
+        return time.time() - self.bot_at < s
+
+    def run(self):
+        threading.Thread(target=self._monitor, daemon=True, name="oma-meter-monitor").start()
+        threading.Thread(target=self._writer, daemon=True, name="oma-meter").start()
+
+    def _monitor(self):
+        while True:
+            if not self.active():
+                time.sleep(0.2)
+                continue
+            try:
+                p = subprocess.Popen(["parec", "-d", "@DEFAULT_MONITOR@", "--raw", "--format=s16le", "--rate=16000",
+                                      "--channels=1", "--latency-msec=20", "--client-name=oma-voice-wake-meter",
+                                      "--stream-name=Voice Wake meter"],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                log("meter: parec failed:", e)
+                time.sleep(2)
+                continue
+            self.mon_proc = p
+            while self.active():
+                d = p.stdout.read(1024)
+                if not d:
+                    break
+                self.mon_tail = (self.mon_tail + d)[-2048:]
+                self.mon_at = time.time()
+            try:
+                p.kill()
+                p.wait(timeout=1)
+            except Exception:
+                pass
+            self.mon_proc = None
+            self.mon_tail = b""
+            time.sleep(0.1)
+
+    def _bands(self, raw):
+        np = self.np
+        if len(raw) < 2048:
+            return None
+        a = np.frombuffer(raw[-2048:], dtype=np.int16).astype(np.float32) / 32768.0
+        m = np.abs(np.fft.rfft(a * self.win)) / 512.0
+        return np.array([20 * np.log10(m[lo:hi].mean() + 1e-9) for lo, hi in self.ranges], dtype=np.float32)
+
+    def _write(self, line):
+        try:
+            tmp = LEVEL + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(line + "\n")
+            os.replace(tmp, LEVEL)
+        except Exception:
+            pass
+
+    def _writer(self):
+        np = self.np
+        zero = np.zeros(METER_BANDS, dtype=np.float32)
+        period = 1.0 / METER_FPS
+        while True:
+            if not self.active():
+                time.sleep(0.2)
+                continue
+            t = time.time()
+            uv, bv = zero, zero
+            user = self._bands(self.mic.tail) if t - self.mic.tail_at < 0.3 else None
+            if user is not None:
+                if self.floor is None:
+                    self.floor = user.copy()
+                # Noise floor per band: drops fast, rises ~0.6 dB/s, never into speech levels.
+                self.floor = np.where(user < self.floor, self.floor * 0.7 + user * 0.3, self.floor + 0.02)
+                self.floor = np.minimum(self.floor, -50.0)
+                uv = np.clip((user - self.floor - 10.0 + self.tilt) / 30.0, 0.0, 1.0)
+            bot = self._bands(self.mon_tail) if t - self.mon_at < 0.3 else None
+            if bot is not None:
+                bv = np.clip((bot + 80.0 + self.tilt) / 42.0, 0.0, 1.0)
+                if float(bv.max()) > 0.15:
+                    self.bot_at = t
+            # The mic also hears the speakers, so while the bot's voice is playing show the bot.
+            who = "bot" if self.bot_recent(0.25) else "user"
+            vals = bv if who == "bot" else uv
+            level = float(np.sqrt((vals * vals).mean()))
+            self._write(f"{who} {level:.3f} " + " ".join(f"{v:.3f}" for v in vals))
+            time.sleep(max(0.005, period - (time.time() - t)))
+
+
+def play_live_sound():
+    """Soft two-tone chime, once, the moment the voice chat goes live (non-blocking)."""
+    if os.path.exists(LIVE_SOUND):
+        try:
+            subprocess.Popen(["pw-play", "--media-role", "Notification", LIVE_SOUND],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            log("live sound failed:", e)
 
 
 def play(name, cfg=None):
@@ -1126,7 +1277,8 @@ class Listener:
         self.cmds = queue.Queue()
         self.phase = "idle"
         self.status_cache = None
-        self.level_until = 0
+        self.meter = Meter(self.mic)
+        self.in_call = False  # a hand-off is running or its voice chat is live
         self.test_until = 0
         self._overlay_gen = 0
 
@@ -1175,25 +1327,13 @@ class Listener:
             finally:
                 c.close()
 
-    def levels(self):
-        while True:
-            if time.time() < self.level_until:
-                try:
-                    with open(LEVEL, "w") as f:
-                        f.write(f"{min(1.0, self.mic.level / 3000.0):.3f}\n")
-                except Exception:
-                    pass
-                time.sleep(0.08)
-            else:
-                time.sleep(0.5)
-
     def threshold(self):
         return 0.95 - 0.4 * max(0.0, min(1.0, float(self.cfg.get("sensitivity", 0.5))))
 
     def run(self):
         self.mic.start()
         threading.Thread(target=self.serve, daemon=True).start()
-        threading.Thread(target=self.levels, daemon=True).start()
+        self.meter.run()
         self.write_status(force=True)
         last_tick = 0
         stop_now = lambda: not self.cmds.empty() or time.time() - last_tick > 10
@@ -1240,6 +1380,12 @@ class Listener:
 
     # wake → (unlock) → overlay → Grok Bot voice
     def wake(self, agent):
+        # Never start a second hand-off over a live call: the bot (or you) saying the name
+        # mid-call used to re-show the overlay, blink it for screenshots and click the
+        # call's own button, which ended the call.
+        if self.in_call or grok_recording():
+            log(f"wake ignored: {agent.get('name')} (voice chat already live)")
+            return
         if session_locked():
             # light the (possibly blanked) lock screen so the prompt and mic state are visible
             subprocess.Popen(["omarchy-system-wake"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1325,9 +1471,10 @@ class Listener:
         overlay = self.cfg.get("overlay", True)
         self._overlay_gen += 1  # cancels any older overlay watcher
         t_start = time.time()
+        self.in_call = True
         if overlay:
             shell_ipc("show", json.dumps({"name": name}))
-            self.level_until = time.time() + 600
+            self.meter.start()
         # The overlay's own Esc / mouse / key dismissal (or its 25 s cap) aborts the hand-off.
         wanted = (lambda: overlay_visible() is not False) if overlay else (lambda: True)
         try:
@@ -1336,11 +1483,15 @@ class Listener:
             outcome, streams = f"error: {e}", set()
         log("hand-off:", name, outcome, f"({time.time() - t_start:.1f}s)")
         if outcome == "voice-live":
+            play_live_sound()
             if overlay:
                 shell_ipc("setLive", "true")
                 self.watch_overlay_end(streams)
+            else:
+                self.in_call = False
             return
-        self.level_until = 0
+        self.in_call = False
+        self.meter.stop()
         if overlay:
             hide_overlay()
         else:
@@ -1354,25 +1505,34 @@ class Listener:
             notify(f"Hey {name}", "Grok Bot didn't open. Open it and click the voice button to talk.")
 
     def watch_overlay_end(self, streams):
-        """While the overlay is up, hide it once the voice chat's own mic stream(s) are gone."""
+        """While the overlay is up, hide it once the call is really over (no Grok Bot mic stream and
+        quiet speakers for CALL_END_S)."""
         gen = self._overlay_gen
         streams = set(streams or ())
 
-        def recording():
-            return bool(grok_streams() & streams) if streams else grok_recording()
+        def in_call():
+            # Any Grok Bot mic stream (it may close and reopen it while the bot talks), or the
+            # bot's voice still coming out of the speakers.
+            return grok_recording() or self.meter.bot_recent()
 
         def watcher():
-            reason = watch_for_voice_end(already_live=True, recording_fn=recording,
-                                         stop_fn=lambda: gen != self._overlay_gen)
+            try:
+                reason = watch_for_voice_end(already_live=True, recording_fn=in_call, gone_s=CALL_END_S,
+                                             stop_fn=lambda: gen != self._overlay_gen)
+            except Exception as e:
+                reason = f"error: {e}"
             if gen != self._overlay_gen:
                 return
-            self.level_until = 0
+            self.in_call = False
+            self.meter.stop()
             if reason in ("mic-ended", "never-appeared"):
                 log("overlay hide:", reason)
                 hide_overlay()
             elif reason == "already-hidden":
                 log("overlay hide: already-hidden")
                 focus_grok()
+            else:
+                log("overlay watch:", reason)
 
         threading.Thread(target=watcher, daemon=True, name="oma-overlay-watch").start()
 

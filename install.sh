@@ -39,7 +39,7 @@ if ((${#missing[@]})); then
 fi
 
 say "Engine files -> $D"
-mkdir -p "$D/bin" "$D/src" "$D/models" "$D/voices" "$D/prompts"
+mkdir -p "$D/bin" "$D/src" "$D/models" "$D/voices" "$D/prompts" "$D/sounds"
 put "$SRC/engine/oma_voice_wake.py" "$D/oma_voice_wake.py" 644
 put "$SRC/engine/oma-vclick.c" "$D/src/oma-vclick.c" 644
 put "$SRC/engine/wlr-virtual-pointer-unstable-v1.xml" "$D/src/wlr-virtual-pointer-unstable-v1.xml" 644
@@ -58,6 +58,13 @@ fi
 for f in en_US-amy-low.onnx en_US-amy-low.onnx.json; do
   [[ -s $D/voices/$f ]] || { say "Piper voice $f"; curl -fsSL -o "$D/voices/$f" "$VOICE_URL/$f"; }
 done
+
+say "Voice-live chime"
+# A soft two-tone chime played once when the voice chat goes live (generated, no download).
+if [[ ! -s $D/sounds/live.wav ]] && command -v ffmpeg >/dev/null; then
+  ffmpeg -loglevel error -y -f lavfi -i "aevalsrc='0.12*(sin(2*PI*784*t)+0.25*sin(2*PI*1568*t))*exp(-7*t)*min(1,t*200) + gte(t,0.13)*0.12*(sin(2*PI*1175*(t-0.13))+0.2*sin(2*PI*2350*(t-0.13)))*exp(-6*(t-0.13))*min(1,(t-0.13)*200)':s=48000:d=0.7" \
+    -af "afade=t=out:st=0.55:d=0.15" -ac 1 -c:a pcm_s16le "$D/sounds/live.wav" || warn "couldn't make the live chime (ffmpeg)"
+fi
 
 say "Spoken prompts (offline Piper voice)"
 while IFS='|' read -r key text; do

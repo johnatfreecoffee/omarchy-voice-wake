@@ -7,8 +7,11 @@
 //   hide / isVisible
 // The official Grok Bot icon is a cropped close-up of the head (chin and left side clipped).
 // install.sh rebuilds head.png as the full head, centered, so it sits inside the disc with padding.
-// The head rocks gently; a phone-call-style bar waveform under the disc follows the
-// microphone level the listener writes to $XDG_RUNTIME_DIR/oma-voice-wake/level.
+// The head rocks gently; a phone-call-style bar waveform under the disc moves in real time.
+// The listener writes ~30 lines/s to $XDG_RUNTIME_DIR/oma-voice-wake/level:
+//   <user|bot> <overall> <16 band levels, low to high>
+// from your mic while you talk and from the speakers (the bot's voice) while it talks.
+// Low bands sit in the middle, mirrored out to both edges.
 import QtQuick
 import Quickshell
 import Quickshell.Io
@@ -29,6 +32,10 @@ Item {
   property bool capturing: false
   property string agentName: ""
   property real level: 0
+  property string who: "user"
+  property var bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  // A deliberate mouse move (not trackpad jitter) dismisses: this far from where it started.
+  readonly property real moveDismissPx: 40
   property double liveAt: 0
   // Input before this time is ignored (overlay just appeared, or a capture just ended and the
   // listener's virtual pointer moved underneath us).
@@ -49,6 +56,7 @@ Item {
     root.live = false
     root.capturing = false
     root.level = 0
+    root.bands = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     root.shown = true
     root.arm(700)
     liveTimer.stop()
@@ -97,15 +105,36 @@ Item {
 
   FileView { id: levelFile; path: root.runDir + "/level"; printErrors: false; blockLoading: true }
   Timer {
-    interval: 80
+    interval: 33
     repeat: true
     running: root.shown && !root.capturing
     onTriggered: {
       levelFile.reload()
-      var v = parseFloat(levelFile.text() || "0")
-      if (isNaN(v)) v = 0
-      v = Math.min(1, Math.max(0, (v - 0.015) * 4))
-      root.level = root.level * 0.6 + v * 0.4
+      var parts = String(levelFile.text() || "").trim().split(/\s+/)
+      var target = []
+      var i
+      if (parts.length >= 18 && (parts[0] === "user" || parts[0] === "bot")) {
+        root.who = parts[0]
+        for (i = 0; i < 16; i++) {
+          var v = parseFloat(parts[i + 2])
+          target.push(isNaN(v) ? 0 : Math.min(1, Math.max(0, v)))
+        }
+      } else {
+        for (i = 0; i < 16; i++) target.push(0)
+      }
+      // Fast attack, softer release: lively but not jittery.
+      var cur = root.bands
+      var next = []
+      var sum = 0
+      for (i = 0; i < 16; i++) {
+        var c = cur[i] || 0
+        var t = target[i]
+        var n = c + (t - c) * (t > c ? 0.7 : 0.28)
+        next.push(n)
+        sum += n * n
+      }
+      root.bands = next
+      root.level = Math.sqrt(sum / 16)
     }
   }
 
@@ -138,7 +167,8 @@ Item {
           acceptedButtons: Qt.AllButtons
           onPositionChanged: function(mouse) {
             if (Date.now() < root.armedAt || root.lastX < 0) { root.lastX = mouse.x; root.lastY = mouse.y; return }
-            if (Math.abs(mouse.x - root.lastX) + Math.abs(mouse.y - root.lastY) > 6) root.userInput()
+            var dx = mouse.x - root.lastX, dy = mouse.y - root.lastY
+            if (Math.sqrt(dx * dx + dy * dy) > root.moveDismissPx) root.userInput()
           }
           onPressed: root.userInput()
           onWheel: function(w) { root.userInput() }
@@ -195,8 +225,9 @@ Item {
 
           Item { width: 1; height: 22 }
 
-          // In-call waveform: 32 rounded bars that grow from the middle, idle sine
-          // floor plus the mic level, colored emerald → cyan → sky.
+          // In-call waveform: 32 rounded bars driven by the live spectrum (mirrored, low
+          // frequencies in the middle), near-flat in silence, colored emerald → cyan → sky.
+          // While the bot talks the palette leans toward sky blue.
           Item {
             id: wave
             anchors.horizontalCenter: parent.horizontalCenter
@@ -223,11 +254,10 @@ Item {
                 antialiasing: true
                 x: index * (wave.barW + wave.gap)
                 anchors.verticalCenter: parent.verticalCenter
-                property real idle: 0.08 + 0.05 * Math.sin(wave.phase + index * 0.35)
-                property real dome: 0.45 + 0.55 * Math.sin(Math.PI * (index + 0.5) / wave.barCount)
-                property real jig: 0.88 + 0.12 * Math.sin(index * 1.7 + 0.4)
-                property real travel: 0.78 + 0.22 * Math.sin(wave.phase * 1.4 - index * 0.22)
-                property real t: Math.max(idle, idle + (1 - idle) * Math.min(1, root.level * 1.35) * dome * jig * travel)
+                property int band: Math.min(15, Math.floor(Math.abs(index - (wave.barCount - 1) / 2)))
+                property real idle: 0.05 + 0.012 * Math.sin(wave.phase + index * 0.35)
+                property real v: root.bands[band] || 0
+                property real t: Math.max(idle, idle + (1 - idle) * v)
                 height: Math.max(width, t * wave.height * 0.95)
                 color: {
                   var u = index / Math.max(1, wave.barCount - 1)
@@ -243,9 +273,13 @@ Item {
                     g = (211 + (189 - 211) * s) / 255
                     b = (238 + (248 - 238) * s) / 255
                   }
+                  if (root.who === "bot") {
+                    r = r * 0.6 + (56 / 255) * 0.4
+                    g = g * 0.6 + (189 / 255) * 0.4
+                    b = b * 0.6 + (248 / 255) * 0.4
+                  }
                   return Qt.rgba(r, g, b, 0.96)
                 }
-                Behavior on height { NumberAnimation { duration: 80; easing.type: Easing.OutCubic } }
               }
             }
           }
