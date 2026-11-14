@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "johnatfreecoffee.voice-wake",
   "name": "Voice Wake",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "author": "johnatfreecoffee",
   "license": "Apache-2.0",
   "description": "Say \"Hey <agent>\" to talk to your Grok Bot agent: a full-screen black wake overlay with the speaking head and a live voice waveform, driven by the oma-voice-wake listener.",

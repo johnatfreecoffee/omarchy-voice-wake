@@ -46,7 +46,9 @@ OVERLAY_MIC_APPEAR_S = 20.0
 OVERLAY_POLL_S = 0.2
 # The call counts as over only when Grok Bot has no mic stream AND the speakers have been quiet
 # for this long. Grok Bot may pause or reopen its mic while the bot talks; that must not end it.
-CALL_END_S = 4.0
+CALL_END_S = 3.0
+BOT_SPEECH_DB = -60.0   # Grok Bot's own playback louder than this (any band) = the bot is talking
+NO_MIC_MAX_S = 60.0     # never hold the overlay longer than this on bot audio alone
 BOT_ACTIVE_S = 1.2
 LIVE_SOUND = os.path.join(APP, "sounds/live.wav")
 METER_FPS = 30
@@ -330,34 +332,45 @@ class Meter:
         threading.Thread(target=self._writer, daemon=True, name="oma-meter").start()
 
     def _monitor(self):
-        while True:
-            if not self.active():
-                time.sleep(0.2)
-                continue
-            try:
-                p = subprocess.Popen(["parec", "-d", "@DEFAULT_MONITOR@", "--raw", "--format=s16le", "--rate=16000",
-                                      "--channels=1", "--latency-msec=20", "--client-name=oma-voice-wake-meter",
-                                      "--stream-name=Voice Wake meter"],
-                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            except Exception as e:
-                log("meter: parec failed:", e)
-                time.sleep(2)
-                continue
-            self.mon_proc = p
-            while self.active():
+        """Capture only Grok Bot's own playback stream (pw-record --target <its serial>), never the
+        whole speaker mix: a TV tab or music must not look like the bot talking."""
+        cur, proc = None, None
+
+        def reader(p):
+            while True:
                 d = p.stdout.read(1024)
                 if not d:
                     break
                 self.mon_tail = (self.mon_tail + d)[-2048:]
                 self.mon_at = time.time()
-            try:
-                p.kill()
-                p.wait(timeout=1)
-            except Exception:
-                pass
-            self.mon_proc = None
-            self.mon_tail = b""
-            time.sleep(0.1)
+
+        while True:
+            want = None
+            if self.active():
+                _, plays = grok_audio()
+                want = plays[-1] if plays else None
+            if want != cur or (proc is not None and proc.poll() is not None):
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
+                proc, cur, self.mon_tail = None, want, b""
+                self.mon_proc = None
+                if want is not None:
+                    try:
+                        proc = subprocess.Popen(
+                            ["pw-record", "--target", str(want), "-P",
+                             "{ stream.capture.sink = true node.dont-fallback = true node.dont-reconnect = true "
+                             "node.name = oma-voice-wake-meter media.name = \"Voice Wake meter\" }",
+                             "--raw", "--rate", str(RATE), "--channels", "1", "--format", "s16", "-"],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                        self.mon_proc = proc
+                        threading.Thread(target=reader, args=(proc,), daemon=True).start()
+                    except Exception as e:
+                        log("meter: pw-record failed:", e)
+            time.sleep(0.5 if self.active() else 0.3)
 
     def _bands(self, raw):
         np = self.np
@@ -397,7 +410,7 @@ class Meter:
             bot = self._bands(self.mon_tail) if t - self.mon_at < 0.3 else None
             if bot is not None:
                 bv = np.clip((bot + 80.0 + self.tilt) / 42.0, 0.0, 1.0)
-                if float(bv.max()) > 0.15:
+                if float(bot.max()) > BOT_SPEECH_DB:
                     self.bot_at = t
             # The mic also hears the speakers, so while the bot's voice is playing show the bot.
             who = "bot" if self.bot_recent(0.25) else "user"
@@ -645,6 +658,27 @@ def grok_streams():
 def grok_recording():
     """True when the Grok Bot app has any microphone stream open."""
     return bool(grok_streams())
+
+
+def grok_audio():
+    """Grok Bot's own live PipeWire streams: (mic source-output indexes, playback object serials),
+    both leaving out corked (paused) streams."""
+    def q(kind):
+        try:
+            return json.loads(sh(["pactl", "-f", "json", "list", kind]) or "[]")
+        except Exception:
+            return []
+    mics = sorted(o.get("index") for o in q("source-outputs")
+                  if _grok_props(o.get("properties", {})) and not o.get("corked"))
+    plays = []
+    for o in q("sink-inputs"):
+        pr = o.get("properties", {})
+        if _grok_props(pr) and not o.get("corked"):
+            try:
+                plays.append(int(pr.get("object.serial") or o.get("index")))
+            except (TypeError, ValueError):
+                pass
+    return mics, sorted(plays)
 
 
 def overlay_visible():
@@ -1049,6 +1083,27 @@ def shoot_window(win, tag=""):
     return img, x0, y0, k
 
 
+def shoot_toplevel(win, tag=""):
+    """grim -T: capture just the Grok Bot window (ext image capture by its stable id), so the
+    overlay stays up. Returns (img, x, y, k) like shoot_window, or None if unsupported."""
+    sid = win.get("stableId")
+    if not sid:
+        return None
+    r = subprocess.run(["grim", "-T", str(sid), "-t", "ppm", "-"], capture_output=True, timeout=5)
+    if r.returncode != 0 or len(r.stdout) < 64:
+        return None
+    img = load_ppm(r.stdout)
+    (wx, wy), (ww, wh) = win["at"], win["size"]
+    k = img.shape[1] / float(max(1, ww))
+    try:
+        save_png(DEBUG_SHOT, img)
+        if tag:
+            save_png(DEBUG_SHOT.replace(".png", f"-{tag}.png"), img)
+    except Exception as e:
+        log("debug screenshot not saved:", e)
+    return img, wx, wy, k
+
+
 def launch_grok(url):
     """Open the agent. xdg-open first; the grok-bot binary is a fallback if the window is late."""
     subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1115,10 +1170,21 @@ def start_voice(cfg, agent, wanted=None, deadline=None):
             if time.time() >= deadline:
                 break
             win = bring_grok_forward(grok_window() or win) or win
-            shell_ipc("setCapture", "true")
-            time.sleep(0.2)
+            # Window-only capture keeps the black overlay up (no blinking); fall back to hiding it
+            # for a full-screen grab only if the compositor can't capture the window by itself.
+            # Try 2 uses the proven hide-and-grab path, in case a click-through click didn't land.
+            shot = None
             try:
-                img, rx, ry, k = shoot_window(win, tag=f"try{attempt}")
+                if attempt == 1:
+                    shot = shoot_toplevel(win, tag=f"try{attempt}")
+            except Exception as e:
+                log("window-only screenshot failed:", e)
+            hid = shot is None
+            if hid:
+                shell_ipc("setCapture", "true")
+                time.sleep(0.2)
+            try:
+                img, rx, ry, k = shot or shoot_window(win, tag=f"try{attempt}")
                 kind, xy, detail = find_voice_button(img, band=int(160 * k))
                 if kind == "voice":
                     pos = (rx + xy[0] / k, ry + xy[1] / k)
@@ -1126,7 +1192,15 @@ def start_voice(cfg, agent, wanted=None, deadline=None):
                     # still-routing window is never clicked.
                     if seen_at and abs(seen_at[0] - pos[0]) <= 4 and abs(seen_at[1] - pos[1]) <= 4:
                         target = pos
-                        subprocess.run([VCLICK, str(int(round(pos[0]))), str(int(round(pos[1])))], timeout=5)
+                        if not hid:
+                            shell_ipc("setPassThrough", "true")  # overlay stays visible, clicks reach Grok Bot
+                            time.sleep(0.05)
+                        try:
+                            subprocess.run([VCLICK, str(int(round(pos[0]))), str(int(round(pos[1])))], timeout=5)
+                        finally:
+                            if not hid:
+                                time.sleep(0.05)
+                                shell_ipc("setPassThrough", "false")
                     seen_at = pos
                 else:
                     seen_at = None
@@ -1134,7 +1208,8 @@ def start_voice(cfg, agent, wanted=None, deadline=None):
                 log("screenshot failed:", e)
                 kind = "none"
             finally:
-                shell_ipc("setCapture", "false")
+                if hid:
+                    shell_ipc("setCapture", "false")
             if target:
                 break
             if kind == "draft":
@@ -1144,7 +1219,7 @@ def start_voice(cfg, agent, wanted=None, deadline=None):
                     break
             else:
                 draft_since = None
-            time.sleep(0.35)
+            time.sleep(0.25)
         log(f"voice button (try {attempt}):", kind, detail, "-> clicked" if target else "")
         if kind == "draft":
             return "draft", set()
@@ -1510,10 +1585,24 @@ class Listener:
         gen = self._overlay_gen
         streams = set(streams or ())
 
+        st = {"mic_gone": None, "last": None}
+
         def in_call():
-            # Any Grok Bot mic stream (it may close and reopen it while the bot talks), or the
-            # bot's voice still coming out of the speakers.
-            return grok_recording() or self.meter.bot_recent()
+            # Live while Grok Bot has an open (uncorked) mic stream. If it pauses or closes the mic
+            # while the bot talks, stay live only while Grok Bot's OWN playback carries speech
+            # (other apps don't count), and at most NO_MIC_MAX_S.
+            mics, plays = grok_audio()
+            now = time.time()
+            if mics:
+                st["mic_gone"] = None
+            elif st["mic_gone"] is None:
+                st["mic_gone"] = now
+            if (mics, plays) != st["last"]:
+                st["last"] = (mics, plays)
+                log("call watch: Grok Bot mic", mics or "-", "playback", plays or "-")
+            if mics:
+                return True
+            return bool(plays) and self.meter.bot_recent(1.0) and now - st["mic_gone"] < NO_MIC_MAX_S
 
         def watcher():
             try:
@@ -1526,7 +1615,7 @@ class Listener:
             self.in_call = False
             self.meter.stop()
             if reason in ("mic-ended", "never-appeared"):
-                log("overlay hide:", reason)
+                log("overlay hide:", "call-ended" if reason == "mic-ended" else reason)
                 hide_overlay()
             elif reason == "already-hidden":
                 log("overlay hide: already-hidden")

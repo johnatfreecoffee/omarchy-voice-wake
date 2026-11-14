@@ -1,6 +1,7 @@
 // Voice Wake overlay. The oma-voice-wake listener drives it over the shell IPC target "voicewake":
 //   show '{"name":"Jack"}'   black full-screen overlay with the head in a white circle (click-through)
-//   setCapture true|false    hide it for one screenshot while the listener finds Grok Bot's voice button
+//   setCapture true|false    hide it for one screenshot (fallback when a window-only capture fails)
+//   setPassThrough true|false  stay visible but let the listener's click reach Grok Bot's voice button
 //   setLive true             voice chat is live (the overlay stays until the chat ends)
 // A mouse move, click, wheel, Esc or any key dismisses it at every stage, including
 // "Starting voice…". While not live it also gives up on its own after 25 s.
@@ -30,6 +31,7 @@ Item {
   property bool shown: false
   property bool live: false
   property bool capturing: false
+  property bool passThrough: false
   property string agentName: ""
   property real level: 0
   property string who: "user"
@@ -55,6 +57,7 @@ Item {
     root.agentName = name
     root.live = false
     root.capturing = false
+    root.passThrough = false
     root.level = 0
     root.bands = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     root.shown = true
@@ -69,6 +72,7 @@ Item {
     root.shown = false
     root.live = false
     root.capturing = false
+    root.passThrough = false
   }
 
   ShellIpc {
@@ -89,6 +93,12 @@ Item {
       if (!c) root.arm(500)
       return "ok"
     }
+    function setPassThrough(on: string): string {
+      var t = (on === "true" || on === "1")
+      root.passThrough = t
+      if (!t) root.arm(500)
+      return "ok"
+    }
     function isVisible(): string { return root.shown ? "true" : "false" }
   }
 
@@ -98,7 +108,7 @@ Item {
   Timer { id: liveTimer; interval: 600000; onTriggered: root.dismiss() }
 
   function userInput() {
-    if (!root.shown || root.capturing || Date.now() < root.armedAt) return false
+    if (!root.shown || root.capturing || root.passThrough || Date.now() < root.armedAt) return false
     root.dismiss()
     return true
   }
@@ -153,7 +163,11 @@ Item {
       WlrLayershell.layer: WlrLayer.Overlay
       // Always takes the keyboard and pointer so Esc / any key / the mouse can dismiss it. The
       // listener hides it (setCapture) for the moment it screenshots and clicks Grok Bot.
-      WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+      WlrLayershell.keyboardFocus: root.passThrough ? WlrKeyboardFocus.None : WlrKeyboardFocus.Exclusive
+      // Click-through only for the instant the listener clicks Grok Bot's voice button.
+      Region { id: noInput }
+      Region { id: allInput; item: content }
+      mask: root.passThrough ? noInput : allInput
 
       Item {
         id: content
