@@ -613,9 +613,12 @@ def bring_grok_forward(win, timeout_s=4.0):
     stage = os.path.join(HOME, ".local/bin/oma-stage")
     if os.access(stage, os.X_OK):
         sh([stage, "promote", win.get("class", "")], 3)
+    if (_on_screen(win, m) and not win.get("hidden")
+            and (hypr_json("activewindow") or {}).get("address") == addr):
+        return win
     t0, last, nudged = time.time(), None, False
     while time.time() - t0 < timeout_s:
-        time.sleep(0.25)
+        time.sleep(0.1)
         w = hypr_find(addr)
         if not w:
             return None
@@ -1095,12 +1098,6 @@ def shoot_toplevel(win, tag=""):
     img = load_ppm(r.stdout)
     (wx, wy), (ww, wh) = win["at"], win["size"]
     k = img.shape[1] / float(max(1, ww))
-    try:
-        save_png(DEBUG_SHOT, img)
-        if tag:
-            save_png(DEBUG_SHOT.replace(".png", f"-{tag}.png"), img)
-    except Exception as e:
-        log("debug screenshot not saved:", e)
     return img, wx, wy, k
 
 
@@ -1130,77 +1127,182 @@ def wait_for_grok_window(timeout_s=WINDOW_WAIT_S, url=None, bin_path=None, wante
     return None
 
 
-def start_voice(cfg, agent, wanted=None, deadline=None):
+HEADERS = os.path.join(STATE, "chat-headers.json")
+HEADER_SAME = 5.0    # largest block difference below this = the same chat header (one letter is ~9)
+
+
+def _header_fp(img, k):
+    """Small grayscale thumbnail of the chat header (agent avatar + name pill), to tell which
+    agent's chat Grok Bot is showing without switching to it."""
+    import numpy as np
+    h, w = img.shape[:2]
+    y1 = max(12, min(h, int(round(46 * k))))
+    g = img[:y1, int(w * 0.50):int(w * 0.80)].mean(axis=2)  # the agent pill, not the tab icons
+    gh, gw = (g.shape[0] // 12) * 12, (g.shape[1] // 72) * 72
+    g = g[:gh, :gw]
+    return g.reshape(12, gh // 12, 72, gw // 72).mean(axis=(1, 3))
+
+
+def _fp_diff(a, b):
+    import numpy as np
+    if a is None or b is None or np.shape(a) != np.shape(b):
+        return 1e9
+    return float(np.abs(np.asarray(a) - np.asarray(b)).max())
+
+
+def load_headers():
+    try:
+        return json.load(open(HEADERS))
+    except Exception:
+        return {}
+
+
+def which_chat(headers, img, k, size):
+    """Name of the saved agent whose chat header matches this shot best, or None."""
+    fp = _header_fp(img, k)
+    best, best_d = None, 1e9
+    for name, rec in headers.items():
+        if list(rec.get("size", [])) != list(size):
+            continue
+        d = _fp_diff(fp, rec.get("fp"))
+        if d < best_d:
+            best, best_d = name, d
+    return best if best_d < HEADER_SAME else None
+
+
+def remember_header(name, img, k, size):
+    try:
+        h = load_headers()
+        h[name] = {"size": list(size), "fp": _header_fp(img, k).round(1).tolist()}
+        write_private(HEADERS, json.dumps(h), 0o600)
+    except Exception as e:
+        log("header not saved:", e)
+
+
+def click_at(pos, through_overlay):
+    """Click Grok Bot's voice button. With the overlay up, make it click-through for the click and
+    move the pointer first: Hyprland only re-picks the surface under the pointer on motion, and
+    the pointer is often still parked on the button from the last hand-off."""
+    x, y = int(round(pos[0])), int(round(pos[1]))
+    if through_overlay:
+        shell_ipc("setPassThrough", "true")
+    try:
+        if through_overlay:
+            subprocess.run([VCLICK, str(x + 9), str(y + 9), "--move-only"], timeout=5)
+        subprocess.run([VCLICK, str(x), str(y)], timeout=5)
+    finally:
+        if through_overlay:
+            shell_ipc("setPassThrough", "false")
+
+
+def start_voice(cfg, agent, wanted=None, deadline=None, marks=None):
     """Open the agent's chat (cold-launching Grok Bot if needed) and press "Start voice chat".
+
+    Fast path (Grok Bot open): one window-only shot; if the header already shows this agent's
+    chat, click at once; otherwise open the agent link and poll the window every 100 ms until
+    its chat is showing. A new Grok Bot mic stream confirms the click.
 
     Returns (outcome, new_mic_streams). outcome: voice-live | draft | button-not-found |
     clicked-unconfirmed | no-window | dismissed | opened | no-agent-id.
-    voice-live means a NEW Grok Bot microphone stream appeared after our click.
     """
     wanted = wanted or (lambda: True)
     deadline = deadline or (time.time() + OVERLAY_START_MAX_S - 2)
+    t_start = time.time()
+    marks = marks if marks is not None else []
+    mark = lambda label: marks.append(f"{label} {time.time() - t_start:.2f}")
+    name = agent.get("name", "")
     aid = agent.get("agentId", "")
     if not aid or "TODO" in aid:
-        notify(f"Hey {agent.get('name')}", "This agent's Grok Bot id isn't set yet (Settings > Voice Wake).")
+        notify(f"Hey {name}", "This agent's Grok Bot id isn't set yet (Settings > Voice Wake).")
         return "no-agent-id", set()
     url = cfg.get("openUrl", DEFAULTS["openUrl"]).replace("{id}", aid)
-    was_open = grok_window() is not None
-    bin_path = launch_grok(url)
-    if not cfg.get("startVoice", True):
-        return "opened", set()
-    win = wait_for_grok_window(min(WINDOW_WAIT_S, max(1, deadline - time.time())), url=url, bin_path=bin_path, wanted=wanted)
-    if not wanted():
-        return "dismissed", set()
-    if not win:
-        return "no-window", set()
-    if not was_open:
-        time.sleep(1.5)  # cold launch: let it route to the agent's chat before we look
-    settle = float(cfg.get("settleMs", 1400)) / 1000.0
+    headers = load_headers()
 
-    # Grok Bot keeps showing the previous chat for a moment after the link: never judge before this.
+    def shot_of(w):
+        try:
+            return shoot_toplevel(w)
+        except Exception as e:
+            log("window-only screenshot failed:", e)
+            return None
+
+    win = grok_window()
+    was_open = win is not None
+    shot, on_chat = None, False
     if was_open:
-        time.sleep(1.8)
+        win = bring_grok_forward(win) or win
+        mark("forward")
+        shot = shot_of(win)
+        if shot is not None:
+            on_chat = which_chat(headers, shot[0], shot[3], win["size"]) == name
+        mark("on-chat" if on_chat else "need-switch")
+    if not on_chat:
+        bin_path = launch_grok(url)
+        if not cfg.get("startVoice", True):
+            return "opened", set()
+        if not was_open:
+            win = wait_for_grok_window(min(WINDOW_WAIT_S, max(1, deadline - time.time())), url=url,
+                                       bin_path=bin_path, wanted=wanted)
+            if not wanted():
+                return "dismissed", set()
+            if not win:
+                return "no-window", set()
+            win = bring_grok_forward(win) or win
+            mark("window")
+        # Poll until this agent's chat is showing: its saved header if we know it, else a header
+        # that changed from before the link and then held still for one frame.
+        known = any(n == name and list(r.get("size", [])) == list(win["size"]) for n, r in headers.items())
+        base = _header_fp(shot[0], shot[3]) if shot is not None else None
+        prev, shot = None, None
+        cap = time.time() + (2.5 if was_open else 6.0)
+        while time.time() < min(cap, deadline):
+            if not wanted():
+                return "dismissed", set()
+            time.sleep(0.1)
+            win = grok_window() or win
+            sh_ = shot_of(win)
+            if sh_ is None:
+                continue
+            fp = _header_fp(sh_[0], sh_[3])
+            if known:
+                if which_chat(headers, sh_[0], sh_[3], win["size"]) == name:
+                    shot, on_chat = sh_, True
+                    break
+            elif _fp_diff(fp, base) > HEADER_SAME and prev is not None and _fp_diff(fp, prev) < HEADER_SAME:
+                shot = sh_
+                break
+            prev = fp
+        mark("chat" if shot is not None else "chat-timeout")
+
     for attempt in (1, 2):
         before = grok_streams()
-        target, seen_at, kind, detail = None, None, "none", ""
+        target, seen_at, kind, detail, used = None, None, "none", "", None
         draft_since = None
         while True:
             if not wanted():
                 return "dismissed", set()
             if time.time() >= deadline:
                 break
-            win = bring_grok_forward(grok_window() or win) or win
-            # Window-only capture keeps the black overlay up (no blinking); fall back to hiding it
-            # for a full-screen grab only if the compositor can't capture the window by itself.
-            # Try 2 uses the proven hide-and-grab path, in case a click-through click didn't land.
-            shot = None
-            try:
-                if attempt == 1:
-                    shot = shoot_toplevel(win, tag=f"try{attempt}")
-            except Exception as e:
-                log("window-only screenshot failed:", e)
-            hid = shot is None
+            hid = attempt == 2  # try 2: the proven hide-and-grab path
             if hid:
+                win = bring_grok_forward(grok_window() or win) or win
                 shell_ipc("setCapture", "true")
-                time.sleep(0.2)
+                time.sleep(0.15)
             try:
-                img, rx, ry, k = shot or shoot_window(win, tag=f"try{attempt}")
+                if hid:
+                    cur = shoot_window(win, tag="try2")
+                else:
+                    cur = shot if shot is not None else shot_of(grok_window() or win)
+                    shot = None
+                    if cur is None:
+                        raise RuntimeError("no window-only shot")
+                img, rx, ry, k = cur
                 kind, xy, detail = find_voice_button(img, band=int(160 * k))
                 if kind == "voice":
                     pos = (rx + xy[0] / k, ry + xy[1] / k)
-                    # Require the same spot on two shots in a row so a half-rendered or
-                    # still-routing window is never clicked.
-                    if seen_at and abs(seen_at[0] - pos[0]) <= 4 and abs(seen_at[1] - pos[1]) <= 4:
-                        target = pos
-                        if not hid:
-                            shell_ipc("setPassThrough", "true")  # overlay stays visible, clicks reach Grok Bot
-                            time.sleep(0.05)
-                        try:
-                            subprocess.run([VCLICK, str(int(round(pos[0]))), str(int(round(pos[1])))], timeout=5)
-                        finally:
-                            if not hid:
-                                time.sleep(0.05)
-                                shell_ipc("setPassThrough", "false")
+                    # A confirmed chat header is enough; otherwise require the same spot twice.
+                    if on_chat or (seen_at and abs(seen_at[0] - pos[0]) <= 4 and abs(seen_at[1] - pos[1]) <= 4):
+                        target, used = pos, cur
+                        click_at(pos, through_overlay=not hid)
                     seen_at = pos
                 else:
                     seen_at = None
@@ -1213,35 +1315,41 @@ def start_voice(cfg, agent, wanted=None, deadline=None):
             if target:
                 break
             if kind == "draft":
-                # Only believe "draft" once it has held for 2 s: the previous chat may still be on screen.
+                # Believe "draft" once it has held (the previous chat may still be on screen).
                 draft_since = draft_since or time.time()
-                if time.time() - draft_since >= 2.0:
+                if time.time() - draft_since >= (0.6 if on_chat else 2.0):
                     break
             else:
                 draft_since = None
-            time.sleep(0.25)
+            time.sleep(0.12)
+        mark(f"click{attempt}" if target else f"no-click{attempt}")
         log(f"voice button (try {attempt}):", kind, detail, "-> clicked" if target else "")
         if kind == "draft":
+            try:
+                save_png(DEBUG_SHOT, img)
+            except Exception:
+                pass
             return "draft", set()
         if target is None:
             return "button-not-found", set()
-        # Confirm: a NEW Grok Bot mic stream (not one that was already open before the click).
         new = set()
         t0 = time.time()
-        while time.time() - t0 < VOICE_CONFIRM_S:
-            time.sleep(0.25)
+        wait_s = 3.0 if attempt == 1 else VOICE_CONFIRM_S
+        while time.time() - t0 < wait_s:
+            time.sleep(0.1)
             new = grok_streams() - before
             if new:
                 break
         if new:
+            mark("live")
             log("voice live: new Grok Bot mic stream", sorted(new))
+            if used is not None:
+                remember_header(name, used[0], used[3], (grok_window() or win)["size"])
             return "voice-live", new
-        log(f"voice button (try {attempt}): no new mic stream within {VOICE_CONFIRM_S:.0f}s")
-        if time.time() + VOICE_CONFIRM_S + 2 > deadline:
+        log(f"voice button (try {attempt}): no new mic stream within {wait_s:.0f}s")
+        if time.time() + VOICE_CONFIRM_S > deadline:
             break
-        time.sleep(settle / 2)
     return "clicked-unconfirmed", set()
-
 
 def _draw_disc(img, cx, cy, r, color):
     import numpy as np
@@ -1422,7 +1530,7 @@ class Listener:
                 self.mic.flush()
                 time.sleep(1)
                 continue
-            for utt in utterances(self.mic, self.gate, max_s=3.0, end_silence_s=0.5, stop=stop_now):
+            for utt in utterances(self.mic, self.gate, max_s=3.0, end_silence_s=0.3, stop=stop_now):
                 agent, conf, heard = self.ears.match_wake(utt, self.threshold())
                 if time.time() < self.test_until:
                     self.test_until = 0
@@ -1549,17 +1657,19 @@ class Listener:
         self.in_call = True
         if overlay:
             shell_ipc("show", json.dumps({"name": name}))
-            self.meter.start()
         # The overlay's own Esc / mouse / key dismissal (or its 25 s cap) aborts the hand-off.
         wanted = (lambda: overlay_visible() is not False) if overlay else (lambda: True)
         try:
-            outcome, streams = start_voice(self.cfg, agent, wanted=wanted, deadline=t_start + OVERLAY_START_MAX_S - 2)
+            marks = []
+            outcome, streams = start_voice(self.cfg, agent, wanted=wanted, deadline=t_start + OVERLAY_START_MAX_S - 2,
+                                           marks=marks)
         except Exception as e:
             outcome, streams = f"error: {e}", set()
-        log("hand-off:", name, outcome, f"({time.time() - t_start:.1f}s)")
+        log("hand-off:", name, outcome, f"({time.time() - t_start:.1f}s)", "[" + ", ".join(locals().get("marks") or []) + "]")
         if outcome == "voice-live":
             play_live_sound()
             if overlay:
+                self.meter.start()
                 shell_ipc("setLive", "true")
                 self.watch_overlay_end(streams)
             else:

@@ -259,8 +259,28 @@ Item {
               running: root.shown && !root.capturing
             }
 
+            // Before voice is live: no bars, just three softly pulsing dots ("connecting").
+            Row {
+              anchors.centerIn: parent
+              spacing: 14
+              opacity: root.live ? 0 : 1
+              visible: opacity > 0
+              Behavior on opacity { NumberAnimation { duration: 200 } }
+              Repeater {
+                model: 3
+                Rectangle {
+                  required property int index
+                  width: 12
+                  height: 12
+                  radius: 6
+                  color: "#ffffff"
+                  opacity: 0.25 + 0.55 * Math.max(0, Math.sin(wave.phase * 2.2 - index * 0.9))
+                }
+              }
+            }
+
             Repeater {
-              model: wave.barCount
+              model: root.live ? wave.barCount : 0
               Rectangle {
                 required property int index
                 width: wave.barW
